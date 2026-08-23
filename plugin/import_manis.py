@@ -213,6 +213,9 @@ def load(reporter, files=(), filepath="", disable_ik=False, set_fps=False):
 			k.reset_field("ori_bones")
 			k.ori_bones[:] = transforms[:, np.asarray(k.ori_channel_to_bone), 0:4]
 			k.pos_bones[:] = transforms[:, np.asarray(k.pos_channel_to_bone), 4:7]
+			if mi.scl_bone_count:
+				k.reset_field("scl_bones")
+				k.scl_bones[:] = transforms[:, np.asarray(k.scl_channel_to_bone), 7:10]
 		import_wsm(corrector, b_action, folder, mi, "srb", b_local_inv_mats)
 		# floats are present for compressed or uncompressed
 		# they can vary in use according to the name of the channel
@@ -292,21 +295,27 @@ def load(reporter, files=(), filepath="", disable_ik=False, set_fps=False):
 					out.rotate(b_key)
 					b_key = out
 				out_keys[frame_i] = keep_quat_hemisphere(b_key, out_keys, frame_i)
-		# ACL clips do not import scale. A compressed clip leaves scl_bones as an empty
-		# 1-D array even when scl_bone_count and scl_bones_names are non-zero (deinosuchus
-		# carries 8 scale bones against a (0,) array), so this loop indexed m_keys[:, bone_i]
-		# and raised "too many indices for array" - it never ran before the compressed and
-		# uncompressed paths were merged, because the ACL branch ended in `continue`.
-		# Filling scl_bones from the decoded transforms is NOT the fix: slots 7:10 come back
-		# as zeros for these tracks, and a zero scale collapses the bone. Until that is
-		# understood, ACL scale is left unimported and key_unanimated_channels supplies the
-		# rest value, which matches the behaviour that was verified against JWE2.
-		scale_channels = () if use_acl else get_channel(
-			k.scl_bones_names, k.scl_bones, b_local_inv_mats, b_action, "scale")
-		for b_channel, b_local_inv_mat, out_keys, in_keys in scale_channels:
+		# Scale needs the same NaN guard the pos and ori loops have. The decoder pre-fills
+		# slots 7:10 with NaN and ACL overwrites only sub-tracks that differ from the bind
+		# pose, so NaN means "equals bind". Feeding NaN through get_scale_mat produced 0,
+		# which collapses the bone - that is why this loop used to be skipped for ACL. The
+		# skip also threw away real animation: 47 of 159 deinosuchus clips carry live scale
+		# on the jaw, head, neck and spine squash joints, peaking at 1.31x (43,413 keys).
+		for b_channel, b_local_inv_mat, out_keys, in_keys in get_channel(
+				k.scl_bones_names, k.scl_bones, b_local_inv_mats, b_action, "scale"):
 			for frame_i, key in enumerate(in_keys):
-				# swizzle
-				key = mathutils.Vector([key[2], key[1], key[0]])
+				# an all-NaN key marks a sub-track ACL stripped as equal to the bind pose;
+				# blender pose scale is relative to rest, so "equals bind" is exactly 1.0
+				if np.isnan(key).all():
+					out_keys[frame_i] = (1.0, 1.0, 1.0)
+					continue
+				if use_acl:
+					# ACL qvv scale shares the native component order of its translation,
+					# which the pos loop above consumes unswizzled
+					key = mathutils.Vector(key)
+				else:
+					# swizzle
+					key = mathutils.Vector([key[2], key[1], key[0]])
 				# correct axes
 				mat = get_scale_mat(key)
 				key = corrector.to_blender(mat).to_scale()
