@@ -53,7 +53,12 @@ def key_unanimated_channels(b_ob, action):
 	bone flung out to the side.
 
 	One rest-value key per missing channel makes each action self-contained.
+
+	Camera clips animate the object itself and have no pose bones, so there is nothing
+	to pad - without this guard they raise 'NoneType' object has no attribute 'bones'.
 	"""
+	if b_ob is None or b_ob.pose is None:
+		return
 	rest = {
 		"location": (0.0, 0.0, 0.0),
 		"rotation_quaternion": (1.0, 0.0, 0.0, 0.0),

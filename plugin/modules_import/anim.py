@@ -42,7 +42,12 @@ class Animation:
 		# https://developer.blender.org/docs/release_notes/4.4/python_api/#slotted-actions
 		if bpy.app.version >= (4, 4, 0):
 			if not b_action.slots:
-				slot = b_action.slots.new(id_type='OBJECT', name=b_obj.name)
+				# the slot must match the datablock it will be assigned to, and this is not
+				# always an Object: camera FOV is keyed on the camera *data*, so hardcoding
+				# 'OBJECT' raised "This slot is not suitable for this data-block type (CA)"
+				# and aborted the whole import. Shape keys (KEY) and node trees (NODETREE)
+				# reach this the same way, see get_rna_path.
+				slot = b_action.slots.new(id_type=b_obj.id_type, name=b_obj.name)
 				b_obj.animation_data.action_slot = slot
 		self.stash(b_obj, b_action)
 		return b_action
