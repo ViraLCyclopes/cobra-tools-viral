@@ -1,5 +1,7 @@
+import os
+
 import bpy.utils.previews
-from bpy.props import StringProperty, BoolProperty
+from bpy.props import StringProperty, BoolProperty, EnumProperty
 from bpy_extras.io_utils import ExportHelper
 
 from plugin import export_ms2, export_spl, export_manis, export_banis, export_fgm
@@ -75,6 +77,60 @@ class ExportManis(ExportOp):
         name="Per Armature",
         description="Exports a single manis for each armature, or lumps all armatures in one manis",
         default=False)
+    export_mode: EnumProperty(
+        name="Group By",
+        description="How actions are grouped into manis files",
+        items=(
+            ('SOURCE', "Source Bundles",
+             "One file per bundle the actions were imported from, which is how the game "
+             "ships them. The chosen file name is only used for actions with no recorded "
+             "source"),
+            ('SINGLE', "One File",
+             "Every action into the chosen file. Only sane when the scene holds a single "
+             "bundle's actions"),
+            ('ACTIVE', "Active Action Only",
+             "Only each armature's active action, into the chosen file"),
+        ),
+        default='SOURCE')
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "export_mode")
+        layout.prop(self, "per_armature")
+        # show exactly what will be written, using the same bucketing the export uses
+        box = layout.box()
+        try:
+            manis_name = os.path.basename(self.filepath) or f"untitled{self.filename_ext}"
+            datas, unstamped = export_manis.collect_export_map(
+                context.scene, manis_name, self.per_armature, self.export_mode)
+        except Exception:
+            box.label(text="Could not preview export", icon='ERROR')
+            return
+        if not datas:
+            box.label(text="No actions to export", icon='ERROR')
+            return
+        total = sum(len(a) for m in datas.values() for a in m.values())
+        box.label(text=f"{total} clips into {len(datas)} file(s)", icon='ANIM')
+        # the side region scrolls, so list every file rather than truncating
+        folder = os.path.dirname(self.filepath)
+        col = box.column(align=True)
+        overwrite = 0
+        for name in sorted(datas):
+            count = sum(len(a) for a in datas[name].values())
+            exists = bool(folder) and os.path.isfile(os.path.join(folder, name))
+            overwrite += exists
+            col.label(text=f"{count:>4}  {name}", icon='ERROR' if exists else 'FILE_BLANK')
+        if overwrite:
+            # SOURCE mode writes the vanilla file names, so exporting into the folder the
+            # bundles were extracted to replaces the originals
+            box.label(text=f"{overwrite} file(s) already exist here", icon='ERROR')
+            box.label(text="and will be OVERWRITTEN.")
+        if unstamped:
+            box.separator()
+            box.label(text=f"{len(unstamped)} action(s) have no source bundle,",
+                      icon='INFO')
+            box.label(text=f"so they go to '{manis_name}'.")
+            box.label(text="Re-import them to record where they came from.")
 
 
 class ExportBanis(ExportOp):

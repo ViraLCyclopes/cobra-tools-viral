@@ -175,15 +175,29 @@ def load(reporter, files=(), filepath="", disable_ik=False, set_fps=False):
 	for mi in manis.mani_infos:
 		logging.info(f"Importing {mi.name}")
 		if "_camera" in mi.name:
-			b_cam_data = bpy.data.cameras.new(mi.name)
+			# reuse a camera of the same name instead of leaving a .001 duplicate behind.
+			# create_action already overwrites by name, so re-importing a camera bundle
+			# used to stack up copies, and the exporter then wrote the clip once per copy
+			b_armature_ob = bpy.data.objects.get(mi.name)
+			if b_armature_ob is None or b_armature_ob.type != "CAMERA":
+				b_cam_data = bpy.data.cameras.new(mi.name)
+				b_armature_ob = create_ob(scene, mi.name, b_cam_data)
+			else:
+				b_cam_data = b_armature_ob.data
+				if b_armature_ob.name not in scene.objects:
+					scene.collection.objects.link(b_armature_ob)
 			# b_cam_data.lens_unit = "FOV"  # no use, as blender can't animate FOV directly
 			b_cam_data.sensor_width = 64  # eyeballed to match game
-			b_armature_ob = create_ob(scene, mi.name, b_cam_data)
 			b_armature_ob.rotation_mode = "QUATERNION"
 			cam_corr = mathutils.Euler((math.radians(90), 0, math.radians(-90))).to_quaternion()
 		b_action = anim_sys.create_action(b_armature_ob, mi.name)
 		# store ovs name
 		b_action["stream"] = manis.stream
+		# remember which bundle this clip came from. manis file names are opaque hashes
+		# (motionextracted.maniset397ff974.manis) and a species ships a dozen of them, so
+		# without this there is no way to send an edited clip back to the right one - and
+		# lumping every action into a single file is not how the game ships them.
+		b_action["manis"] = manis_name
 		b_action["fps"] = int(round((mi.frame_count-1) / mi.duration))
 		# print(mi)
 		logging.debug(f"Compression = {mi.dtype.compression}")

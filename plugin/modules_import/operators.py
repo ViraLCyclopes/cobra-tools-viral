@@ -5,6 +5,7 @@ from bpy_extras.io_utils import ImportHelper
 
 from plugin import import_banis, import_manis, import_matcol, import_fgm, import_ms2, import_spl, import_voxelskirt
 from plugin.utils.operators import BaseOp
+from plugin.utils.manis_info import draw_clip_list
 
 
 class ImportOp(BaseOp, ImportHelper):
@@ -64,6 +65,13 @@ class ImportManis(BulkImportOp):
 							 default=True)
 	# set_fps: BoolProperty(name="Adjust FPS", description="Set the scene to FPS used by BANI", default=True)
 	target = import_manis.load
+
+	def draw(self, context):
+		layout = self.layout
+		layout.prop(self, "disable_ik")
+		# manis file names are opaque hashes, so list what is actually inside the
+		# highlighted file rather than making the user import it to find out
+		draw_clip_list(layout, self.filepath)
 
 
 class ImportMatcol(ImportOp):

@@ -51,11 +51,16 @@ def export_wsm(folder, mani_info, bone_name, channel_storage):
 				pass
 
 
-def save(reporter, filepath="", per_armature=False):
-	folder, manis_name = os.path.split(filepath)
-	scene = bpy.context.scene
-	bpy.ops.object.mode_set(mode='OBJECT')
+def collect_export_map(scene, manis_name, per_armature=False, export_mode="SOURCE"):
+	"""Bucket every exportable action into the manis file it should be written to.
+
+	Returns (manis_datas, unstamped) where manis_datas is
+	{export_name: {armature: set(actions)}} and unstamped lists actions that wanted a
+	source bundle but had none. Shared by the exporter and by the file dialog's preview,
+	so what the dialog promises is what the export actually does.
+	"""
 	manis_datas = {}
+	unstamped = []
 	export_objects = get_armatures_collections(scene)
 	for b_ob in scene.objects:
 		if b_ob.type == "CAMERA":
@@ -64,24 +69,55 @@ def save(reporter, filepath="", per_armature=False):
 		if not b_ob:
 			logging.warning(f"No armature was found in MDL2 '{mdl2_coll.name}' - did you delete it?")
 			continue
-		logging.info(f"Exporting actions for {b_ob.name}")
 		# animation_data needn't be present on all armatures
 		if not b_ob.animation_data:
 			logging.info(f"No animation data on '{b_ob.name}'")
 			continue
-		# decide on exported name of manis file
-		if per_armature:
-			export_name = f"{b_ob.name}_{manis_name}"
-		else:
-			export_name = manis_name
-		# store data for actual export later
-		if export_name not in manis_datas:
-			manis_datas[export_name] = {}
-		anim_map = manis_datas[export_name]
-		if b_ob not in anim_map:
-			anim_map[b_ob] = set()
-		# store actions that are valid for this armature
-		anim_map[b_ob].update(get_actions(b_ob))
+		b_actions = get_actions(b_ob)
+		if export_mode == "ACTIVE":
+			active = b_ob.animation_data.action
+			if not active:
+				logging.warning(f"No active action on '{b_ob.name}', nothing to export")
+				continue
+			b_actions = [active]
+		for b_action in b_actions:
+			# decide on exported name of manis file
+			if export_mode == "SOURCE":
+				base = get_property(b_action, "manis", default="") or manis_name
+				if base == manis_name:
+					unstamped.append(b_action.name)
+			else:
+				base = manis_name
+			export_name = f"{b_ob.name}_{base}" if per_armature else base
+			manis_datas.setdefault(export_name, {}).setdefault(b_ob, set()).add(b_action)
+	return manis_datas, unstamped
+
+
+def save(reporter, filepath="", per_armature=False, export_mode="SOURCE"):
+	"""Export actions to .manis.
+
+	`export_mode` decides how actions are grouped into files:
+
+	SOURCE   one file per source bundle, using the `manis` property the importer stamps
+	         on each action. This is the only mode that reproduces how the game ships
+	         animations - a species spreads its clips over a dozen bundles, and an OVL
+	         injection needs each clip back in the bundle it came from.
+	SINGLE   every action into the one chosen file (the historic behaviour). Fine when
+	         the scene only holds one bundle's actions, which is how this worked for
+	         JWE2, but it silently lumps 159 clips into one 30 MB file otherwise.
+	ACTIVE   only each armature's active action, into the chosen file.
+
+	In SOURCE mode the chosen file name is only a fallback for actions with no `manis`
+	property; the folder is always taken from `filepath`.
+	"""
+	folder, manis_name = os.path.split(filepath)
+	scene = bpy.context.scene
+	bpy.ops.object.mode_set(mode='OBJECT')
+	manis_datas, unstamped = collect_export_map(scene, manis_name, per_armature, export_mode)
+	if unstamped:
+		reporter.show_warning(
+			f"{len(unstamped)} action(s) have no source bundle recorded and went to "
+			f"'{manis_name}' - re-import them to stamp it, e.g. {unstamped[0]}")
 
 	# export the actual manis
 	for export_name, anim_map in manis_datas.items():

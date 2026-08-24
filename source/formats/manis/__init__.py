@@ -467,7 +467,15 @@ class ManisFile(InfoHeader, IoFile):
         self.mani_count = len(self.mani_infos)
         self.names[:] = [mani.name for mani in self.mani_infos]
         self.header.mani_files_size = self.mani_count * 16
-        target_names = set()
+        # Frontier orders the name buffer by FIRST APPEARANCE - walk the clips in order
+        # and, within each clip, its pos, ori, scl then floats channel names. Verified
+        # against 22/22 shipped bundles across deinosuchus, dimetrodon and indoraptor.
+        # This used to write sorted(target_names), which is alphabetical and matches no
+        # vanilla bundle; the resulting file re-parses fine because the ManiBlock name
+        # indices are rewritten to agree with it, so only a diff against vanilla catches
+        # it. Preserve the shipped order rather than inventing one.
+        target_names = []
+        seen = set()
         for mani_info in self.mani_infos:
             # logging.debug(f"ManiInfo {mani_info.name} getting names")
             try:
@@ -475,13 +483,15 @@ class ManisFile(InfoHeader, IoFile):
             except AttributeError:
                 logging.warning(f"ManiInfo {mani_info.name} has no keys")
                 raise
-            target_names.update(k.pos_bones_names)
-            target_names.update(k.ori_bones_names)
-            target_names.update(k.scl_bones_names)
-            target_names.update(k.floats_names)
+            for names in (k.pos_bones_names, k.ori_bones_names, k.scl_bones_names, k.floats_names):
+                for name in names:
+                    key = str(name)
+                    if key not in seen:
+                        seen.add(key)
+                        target_names.append(name)
         self.header.hash_block_size = len(target_names) * 4
         self.reset_field("name_buffer")
-        self.name_buffer.target_names[:] = sorted(target_names)
+        self.name_buffer.target_names[:] = target_names
         self.name_buffer.target_hashes[:] = [djb2(name.lower()) for name in self.name_buffer.target_names]
 
         for mani_info in self.mani_infos:

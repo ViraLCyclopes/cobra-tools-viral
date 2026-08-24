@@ -77,7 +77,23 @@ class CompressedHeaderReader(BaseStruct):
 
 	@classmethod
 	def write_fields(cls, stream, instance):
+		"""Write the verbatim database blob back, or nothing if there is none.
+
+		`read_fields` sets `data` to a bytes blob, or None when the bundle carries no ACL
+		database. A *freshly constructed* instance has neither: the schema declares
+		`data` as an abstract `CompressedHeader`, so `set_defaults` builds a struct there,
+		and writing it raised `a bytes-like object is required, not 'CompressedHeader'` on
+		every Blender export.
+
+		Writing nothing in that case is what the format actually does - the shipped
+		`hatcheryexitcamera` bundle is dtype 0 with no database and occupies zero bytes
+		in this region, reading back as `data is None`.
+		"""
 		instance.io_start = stream.tell()
-		if instance.data:
+		if isinstance(instance.data, (bytes, bytearray, memoryview)):
 			stream.write(instance.data)
+		elif instance.data is not None:
+			logging.debug(
+				f"CompressedHeaderReader has no database blob "
+				f"({type(instance.data).__name__}), writing nothing")
 		instance.io_size = stream.tell() - instance.io_start
