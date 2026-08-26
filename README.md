@@ -12,5 +12,11 @@ A simple GUI for extracting OVL and OVS archives and modifying their contents, a
 - [Tutorial: Planet Zoo New Species Mod](https://www.youtube.com/watch?v=cBauGq4Y1ao)
 
 ## Get in touch
+
+- THIS FORK IS MAINTAINED BY VIRAL CYCLOPES
+- [ViraL Cyclopes Community server](https://discord.gg/yrcpYUp4nR)
+  
 Some Discords where modding progress is discussed can be found here:
 - [Open Naja Modding Community](https://discord.gg/Su4jXKk)
+
+
