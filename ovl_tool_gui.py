@@ -1,6 +1,8 @@
 import contextlib
 import os
 import shutil
+import subprocess
+import sys
 import logging
 import tempfile
 import time
@@ -185,6 +187,7 @@ class MainWindow(window.MainWindow):
 			widgets.VIEW_MENU: self.view_menu_items,
 			widgets.UTIL_MENU: [
 				MenuItem("Open Tools Dir", self.open_tools_dir, icon="home"),
+				MenuItem("Motiongraph Editor", self.open_motiongraph_editor),
 				MenuItem("Export File List", self.save_file_list),
 				MenuItem("Compare with other OVL", self.compare_ovls, icon="compare"),
 				# --- Dev Tools Submenu ---
@@ -231,6 +234,13 @@ class MainWindow(window.MainWindow):
 		self.preferences_widget = window.ConfigWindow(self)
 		self.preferences_widget.setWindowTitle(f"Preferences")
 		self.preferences_widget.show()
+
+	def open_motiongraph_editor(self):
+		"""Launch the fixed-topology editor separately from ordinary OVL injection."""
+		command = [sys.executable, os.path.join(os.path.dirname(__file__), "motiongraph_tool_gui.py")]
+		if self.file_widget and self.file_widget.filepath:
+			command.append(self.file_widget.filepath)
+		subprocess.Popen(command)
 
 	def abs_path_from_row(self, row_data):
 		start_dir = self.ovl_manager.dirs.get_root()

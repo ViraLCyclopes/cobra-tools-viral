@@ -5,6 +5,7 @@
     - [Credits](Credits.md)
 - [Blog](blog/index.md)
 - [Development](Development/)
+    - [JWE3 motiongraph editing](Development/Reverse-Engineering/JWE3-Motiongraphs.md)
 - [Guides](Guides/)
 - [Modding FAQ](Modding-FAQ/)
 - [Tools FAQ](Tools-FAQ/)

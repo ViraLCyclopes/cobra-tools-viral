@@ -8,6 +8,11 @@ Subcommands:
   extract  - extract files from an OVL
   inject   - inject/replace files into an OVL
   retarget-family - fixed-width, hash-preserving JWE3 species-family retarget
+  motiongraph-fields - inspect fields and optionally create a fixed-size patch plan
+  motiongraph-apply  - apply a verified patch plan without rebuilding topology
+  motiongraph-report - render the anonymous state graph or decision tree
+  motiongraph-retarget-clip - repoint references to an existing same-pool clip string
+  motiongraph-string-slot   - replace text within one existing string allocation
 
 Examples:
   ovl_tool_cmd.py extract -i path/to/main.ovl 
@@ -18,11 +23,14 @@ Examples:
 from __future__ import annotations
 
 from utils import config
-from utils.logs import logging_setup # type: ignore
+from utils.logs import get_global_listener, logging_setup # type: ignore
 import logging
-logging_setup("ovl_tool_cmd")
+# Command output belongs on stdout.  Avoid creating/rotating a log beside the
+# tool, which also makes parallel CLI runs contend for the same file.
+logging_setup("ovl_tool_cmd", log_to_file=False)
 
 import argparse
+import json
 import os
 import sys
 from typing import Iterable, List, Optional
@@ -382,6 +390,189 @@ def cmd_retarget_family(args: argparse.Namespace) -> None:
         logging.success("  %s", path)
 
 
+def cmd_motiongraph_fields(args: argparse.Namespace) -> None:
+    """Locate verified activity fields and optionally emit a patch plan."""
+    from pathlib import Path
+    from source.formats.motiongraph.edit import build_patch_plan, locate_fields, save_plan
+
+    source = Path(args.ovl).resolve()
+    ensure_exists(str(source), "file")
+    try:
+        rows, mismatches = locate_fields(
+            source,
+            name=args.name,
+            game=resolve_game_label(args.game),
+            activity=args.activity,
+            activity_type=args.activity_type,
+            field=args.field,
+        )
+    except Exception as exc:
+        die(f"motiongraph field scan failed: {exc}")
+
+    bad = [field for row in rows for field in row["fields"] if not field["verified"]]
+    total = sum(len(row["fields"]) for row in rows)
+    for row in rows:
+        print(
+            f"\n{row['activity']} [{row['activity_type']}] "
+            f"pool {row['pool']} @ {row['payload_offset']}"
+        )
+        for item in row["fields"]:
+            display = item.get("curve_value", item["value"])
+            verified = "" if item["verified"] else " MISMATCH"
+            print(
+                f"  {item['path']:<38} {item['kind']:<8} "
+                f"pool {item['pool']}:{item['offset']} = {display}{verified}"
+            )
+    print(
+        f"\nactivities={len(rows)} fields={total} "
+        f"verified={total - len(bad)} mismatched={len(bad)}"
+    )
+    for struct_name, (declared, actual) in sorted(mismatches.items()):
+        print(f"skipped {struct_name} array: declared stride {declared}, actual {actual}")
+    if args.json:
+        json_path = Path(args.json).resolve()
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        logging.success("Wrote field report: %s", json_path)
+    if bad:
+        die("At least one computed address disagrees with the decoded value")
+
+    writes = [args.set_value is not None, bool(args.set_flag), args.set_enum is not None]
+    if any(writes):
+        if not args.field or not args.plan:
+            die("A write selection requires both --field and --plan")
+        try:
+            plan = build_patch_plan(
+                rows, source, args.name, args.field,
+                value=args.set_value,
+                flag_ops=args.set_flag or None,
+                enum_name=args.set_enum,
+            )
+            plan_path = Path(args.plan).resolve()
+            save_plan(plan_path, plan)
+        except Exception as exc:
+            die(f"Could not create patch plan: {exc}")
+        logging.success("Wrote %d-edit patch plan: %s", len(plan["edits"]), plan_path)
+
+
+def cmd_motiongraph_apply(args: argparse.Namespace) -> None:
+    """Apply a same-width motiongraph plan to a staged OVL."""
+    from pathlib import Path
+    from source.formats.motiongraph.edit import apply_patch_plan
+
+    source = Path(args.ovl).resolve()
+    output = Path(args.output).resolve()
+    plan_path = Path(args.plan).resolve()
+    ensure_exists(str(source), "file")
+    ensure_exists(str(plan_path), "file")
+    if output.exists() and not args.force:
+        die(f"Output already exists: {output} (use --force to replace it)")
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        report = apply_patch_plan(
+            source, output, plan, game=resolve_game_label(args.game)
+        )
+    except Exception as exc:
+        die(f"motiongraph patch failed: {exc}")
+    logging.success(
+        "Patched %d addresses across %d STATIC pools (%d changed bytes)",
+        report.edits, report.pools, report.changed_bytes,
+    )
+    logging.success(
+        "STATIC topology preserved: %d pools, %d fragments, %d uncompressed bytes",
+        report.static_pools, report.static_fragments, report.uncompressed_size,
+    )
+    logging.success(
+        "STATIC compressed size: %d -> %d", report.compressed_before,
+        report.compressed_after,
+    )
+    logging.success("Wrote staged OVL: %s", report.output)
+
+
+def cmd_motiongraph_report(args: argparse.Namespace) -> None:
+    """Render a state/activity report or the MRF decision tree."""
+    from pathlib import Path
+    from source.formats.motiongraph.edit import load_motiongraph
+    from source.formats.motiongraph.report import build_decision_report, build_state_report
+
+    source = Path(args.ovl).resolve()
+    output = Path(args.output).resolve()
+    ensure_exists(str(source), "file")
+    if args.kind != "state" and args.json:
+        die("--json is only available for the state report")
+    try:
+        _, loader = load_motiongraph(source, args.name, resolve_game_label(args.game))
+        if args.kind == "state":
+            report, payload, stats = build_state_report(loader)
+        else:
+            report, stats = build_decision_report(loader)
+            payload = None
+    except Exception as exc:
+        die(f"motiongraph report failed: {exc}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(report, encoding="utf-8")
+    logging.success("Wrote %s report: %s", args.kind, output)
+    if args.json:
+        json_path = Path(args.json).resolve()
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logging.success("Wrote state JSON: %s", json_path)
+    if args.kind == "state":
+        print(f"states={stats.states} edges={stats.edges} conditions={stats.conditions}")
+    else:
+        print(
+            f"states={stats.states} decision_nodes={stats.decision_nodes} "
+            f"blocks={stats.decision_blocks} opcodes={stats.opcodes}"
+        )
+
+
+def _check_staged_output(args: argparse.Namespace):
+    output = os.path.abspath(args.output)
+    if os.path.exists(output) and not args.force:
+        die(f"Output already exists: {output} (use --force to replace the staged copy)")
+
+
+def cmd_motiongraph_retarget_clip(args: argparse.Namespace) -> None:
+    from pathlib import Path
+    from source.formats.motiongraph.static_patch import repoint_existing_string
+
+    _check_staged_output(args)
+    try:
+        report = repoint_existing_string(
+            Path(args.ovl), Path(args.output), args.source_string, args.target_string,
+            expected_count=args.expect_count, game=resolve_game_label(args.game),
+        )
+    except Exception as exc:
+        die(f"motiongraph clip retarget failed: {exc}")
+    logging.success(
+        "Repointed %d fragments: pool %d, %d -> %d (%d changed bytes)",
+        report.references, report.source_pool, report.source_offset,
+        report.target_offset, report.changed_bytes,
+    )
+    logging.success("Topology unchanged: %s", report.topology)
+    logging.success("Wrote and reloaded staged family: %s", report.output)
+
+
+def cmd_motiongraph_string_slot(args: argparse.Namespace) -> None:
+    from pathlib import Path
+    from source.formats.motiongraph.static_patch import patch_string_slot
+
+    _check_staged_output(args)
+    try:
+        report = patch_string_slot(
+            Path(args.ovl), Path(args.output), args.source_string, args.target_string,
+            expected_offset=args.expect_offset, game=resolve_game_label(args.game),
+        )
+    except Exception as exc:
+        die(f"motiongraph string-slot patch failed: {exc}")
+    logging.success(
+        "Patched string slot in pool %d at %d (%d changed bytes)",
+        report.source_pool, report.source_offset, report.changed_bytes,
+    )
+    logging.success("Topology unchanged: %s", report.topology)
+    logging.success("Wrote and reloaded staged family: %s", report.output)
+
+
 # -----------------------------------------------------------------------------
 # Argument parsing
 # -----------------------------------------------------------------------------
@@ -552,13 +743,113 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ret.set_defaults(func=cmd_retarget_family)
 
+    # motiongraph-fields
+    p_mgf = sub.add_parser(
+        "motiongraph-fields",
+        help="Inspect verified fixed-width motiongraph activity fields and make patch plans.",
+    )
+    p_mgf.add_argument("ovl", help="Source OVL containing the motiongraph.")
+    p_mgf.add_argument(
+        "-g", "--game", default="Jurassic World Evolution 3",
+        choices=game_vals if game_vals else None,
+    )
+    p_mgf.add_argument(
+        "--name", help="Internal .motiongraph name; auto-detected when exactly one exists.",
+    )
+    p_mgf.add_argument("--activity", help="Case-insensitive substring of the activity label.")
+    p_mgf.add_argument("--activity-type", help="Exact activity payload type.")
+    p_mgf.add_argument("--field", help="Exact payload field path, for example speed.float.")
+    p_mgf.add_argument("--json", help="Optional JSON field-report output path.")
+    p_mgf.add_argument("--set", dest="set_value", type=float, help="Set a scalar or curve value.")
+    p_mgf.add_argument(
+        "--set-flag", action="append", default=[], metavar="NAME=0|1",
+        help="Set or clear one named bitfield flag; repeatable.",
+    )
+    p_mgf.add_argument("--set-enum", help="Select a named enum value.")
+    p_mgf.add_argument("--plan", help="Write a self-verifying JSON patch plan.")
+    p_mgf.set_defaults(func=cmd_motiongraph_fields)
+
+    # motiongraph-apply
+    p_mga = sub.add_parser(
+        "motiongraph-apply",
+        help="Apply a fixed-size plan to STATIC without rebuilding motiongraph topology.",
+    )
+    p_mga.add_argument("ovl", help="Source OVL; it is never overwritten.")
+    p_mga.add_argument("-o", "--output", required=True, help="Staged output OVL.")
+    p_mga.add_argument("--plan", required=True, help="Plan from motiongraph-fields.")
+    p_mga.add_argument(
+        "-g", "--game", default="Jurassic World Evolution 3",
+        choices=game_vals if game_vals else None,
+    )
+    p_mga.add_argument("--force", action="store_true", help="Replace an existing staged output.")
+    p_mga.set_defaults(func=cmd_motiongraph_apply)
+
+    # motiongraph-report
+    p_mgr = sub.add_parser(
+        "motiongraph-report",
+        help="Render a human-readable state/activity graph or MRF decision tree.",
+    )
+    p_mgr.add_argument("ovl", help="Source OVL containing the motiongraph.")
+    p_mgr.add_argument("-o", "--output", required=True, help="Markdown output path.")
+    p_mgr.add_argument("--kind", choices=("state", "decision"), default="state")
+    p_mgr.add_argument(
+        "--name", help="Internal .motiongraph name; auto-detected when exactly one exists.",
+    )
+    p_mgr.add_argument("--json", help="Optional structured output for --kind state.")
+    p_mgr.add_argument(
+        "-g", "--game", default="Jurassic World Evolution 3",
+        choices=game_vals if game_vals else None,
+    )
+    p_mgr.set_defaults(func=cmd_motiongraph_report)
+
+    # motiongraph-retarget-clip
+    p_mgret = sub.add_parser(
+        "motiongraph-retarget-clip",
+        help="Repoint matching fragments to another existing same-pool clip string.",
+    )
+    p_mgret.add_argument("ovl", help="Pristine source OVL; never overwritten.")
+    p_mgret.add_argument("-o", "--output", required=True, help="Same-named OVL in a full staged family.")
+    p_mgret.add_argument("--from", dest="source_string", required=True, help="Exact existing source string.")
+    p_mgret.add_argument("--to", dest="target_string", required=True, help="Exact existing target string.")
+    p_mgret.add_argument("--expect-count", type=int, required=True, help="Required source fragment count.")
+    p_mgret.add_argument(
+        "-g", "--game", default="Jurassic World Evolution 3",
+        choices=game_vals if game_vals else None,
+    )
+    p_mgret.add_argument("--force", action="store_true", help="Replace the staged OVL.")
+    p_mgret.set_defaults(func=cmd_motiongraph_retarget_clip)
+
+    # motiongraph-string-slot
+    p_mgstr = sub.add_parser(
+        "motiongraph-string-slot",
+        help="Replace one unique STATIC string without growing its allocation.",
+    )
+    p_mgstr.add_argument("ovl", help="Pristine source OVL; never overwritten.")
+    p_mgstr.add_argument("-o", "--output", required=True, help="Same-named OVL in a full staged family.")
+    p_mgstr.add_argument("--from", dest="source_string", required=True, help="Exact unique source string.")
+    p_mgstr.add_argument("--to", dest="target_string", required=True, help="ASCII replacement fitting the source slot.")
+    p_mgstr.add_argument("--expect-offset", type=int, help="Optional required source offset.")
+    p_mgstr.add_argument(
+        "-g", "--game", default="Jurassic World Evolution 3",
+        choices=game_vals if game_vals else None,
+    )
+    p_mgstr.add_argument("--force", action="store_true", help="Replace the staged OVL.")
+    p_mgstr.set_defaults(func=cmd_motiongraph_string_slot)
+
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    finally:
+        # The CLI logger is asynchronous. Drain it so short commands do not lose
+        # their final success/error summary when the Python process exits.
+        listener = get_global_listener()
+        if listener is not None:
+            listener.stop()
 
 
 if __name__ == "__main__":
