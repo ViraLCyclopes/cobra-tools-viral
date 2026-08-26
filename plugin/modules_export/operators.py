@@ -92,11 +92,31 @@ class ExportManis(ExportOp):
              "Only each armature's active action, into the chosen file"),
         ),
         default='SOURCE')
+    jwe3_scale_mode: EnumProperty(
+        name="JWE3 Scale",
+        description="How scale channels are written for JWE3 MANIS bundles",
+        items=(
+            ('OMIT', "Omit (Recommended)",
+             "Remove scale channels from every exported clip. Current JWE3 dtype-0 "
+             "scale blocks crash dinosaur bundles"),
+            ('WRITE', "Write (Experimental)",
+             "Write Blender scale channels for format research. Current output is "
+             "known to crash JWE3 dinosaur bundles"),
+        ),
+        default='OMIT')
 
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "export_mode")
         layout.prop(self, "per_armature")
+        if context.scene.cobra.game == "Jurassic World Evolution 3":
+            layout.prop(self, "jwe3_scale_mode")
+            scale_box = layout.box()
+            if self.jwe3_scale_mode == 'OMIT':
+                scale_box.label(text="Scale will be removed from every clip.", icon='CHECKMARK')
+                scale_box.label(text="Rotation, translation, and floats are preserved.")
+            else:
+                scale_box.label(text="Experimental scale currently crashes JWE3.", icon='ERROR')
         # show exactly what will be written, using the same bucketing the export uses
         box = layout.box()
         try:

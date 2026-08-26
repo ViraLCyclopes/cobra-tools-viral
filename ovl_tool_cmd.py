@@ -7,6 +7,7 @@ Subcommands:
   new      - create a new OVL from a folder
   extract  - extract files from an OVL
   inject   - inject/replace files into an OVL
+  retarget-family - fixed-width, hash-preserving JWE3 species-family retarget
 
 Examples:
   ovl_tool_cmd.py extract -i path/to/main.ovl 
@@ -348,6 +349,39 @@ def cmd_inject(args: argparse.Namespace) -> None:
     logging.success("Injected files into %s", out_ovl)
 
 
+def cmd_retarget_family(args: argparse.Namespace) -> None:
+    """Build a complete JWE3 family using a fixed-width djb2-collision alias."""
+    from source.formats.ovl.retarget import retarget_family
+
+    try:
+        report = retarget_family(
+            args.ovl,
+            args.output,
+            args.donor,
+            args.alias,
+            game=resolve_game_label(args.game),
+            force=args.force,
+        )
+    except Exception as exc:
+        die(f"retarget-family failed: {exc}")
+
+    logging.success(
+        "Retargeted %d loaders and %d STATIC pool strings (%d bytes) in pools %s",
+        report.renamed_loaders,
+        report.pool_strings,
+        report.pool_bytes,
+        list(report.pool_indices),
+    )
+    logging.success(
+        "STATIC compressed size: %d -> %d",
+        report.static_compressed_before,
+        report.static_compressed_after,
+    )
+    logging.success("Verified and wrote %d family files:", len(report.output_files))
+    for path in report.output_files:
+        logging.success("  %s", path)
+
+
 # -----------------------------------------------------------------------------
 # Argument parsing
 # -----------------------------------------------------------------------------
@@ -483,6 +517,40 @@ def build_parser() -> argparse.ArgumentParser:
              "must already exist in the OVL and keep the same shape.",
     )
     p_inj.set_defaults(func=cmd_inject)
+
+    # retarget-family
+    p_ret = sub.add_parser(
+        "retarget-family",
+        help="Retarget a complete JWE3 asset family with a fixed-width djb2 alias.",
+    )
+    p_ret.add_argument(
+        "ovl",
+        help="Donor .ovl; all sibling .ovs companions and referenced AUX files are staged.",
+    )
+    p_ret.add_argument(
+        "-o", "--output",
+        required=True,
+        help="Output .ovl path. Companion files are written beside it.",
+    )
+    p_ret.add_argument(
+        "-g", "--game",
+        choices=game_vals if game_vals else None,
+        default="Jurassic World Evolution 3",
+        help="Game identifier; currently restricted to Jurassic World Evolution 3.",
+    )
+    p_ret.add_argument(
+        "--from", dest="donor", required=True,
+        help="Lowercase donor prefix, for example deinosuchus.",
+    )
+    p_ret.add_argument(
+        "--to", dest="alias", required=True,
+        help="Equal-width lowercase alias with the same djb2 hash state.",
+    )
+    p_ret.add_argument(
+        "--force", action="store_true",
+        help="Replace an existing output family, but never the donor family.",
+    )
+    p_ret.set_defaults(func=cmd_retarget_family)
 
     return parser
 

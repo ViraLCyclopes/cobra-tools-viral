@@ -17,6 +17,11 @@ Layout per ManiBlock, verified against the shipped camera bundle:
     ShrBones f32[frames][scl][2] | SclBones f32[frames][scl][3] | Floats f32[frames][flo]
     pad to 8
 
+`--omit-shear` is the JWE3 scale-layout experiment. Runtime disassembly shows that
+the crashing reader consumes a scale float (`0x3F800000`) as a channel-table index,
+proving the block walk is misaligned. ShrBones is only evidenced in DLA and PZ; this
+option keeps SclBones but leaves ShrBones out.
+
 Blocks are aligned to 16 relative to the start of the keys buffer.
 
   python manis_uncompress_cmd.py IN.manis --ms2 models.ms2 --out OUT.manis
@@ -42,6 +47,10 @@ QVVF = 12
 MANI_INFO_SIZE = 304
 ORI_SCALE = 16384.0
 DTYPE_OFFSET = 8            # dtype sits 8 bytes into a ManiInfo
+ORI_RELATED_OFFSET = 288    # JWE3 ubyte BoneIndex fields in the 304-byte ManiInfo
+ORI_REPEAT_OFFSET = 289
+SCL_RELATED_OFFSET = 290
+SCL_REPEAT_OFFSET = 291
 COMPRESSION_BIT = 1 << 4
 HAS_LIST_MASK = 3 << 5
 
@@ -80,29 +89,93 @@ def yaw(values, track, degrees):
 	return values
 
 
-def build_block(mani_info, keys, names_lut, samples, scalars):
+def resample_frames(values, frame_count):
+	"""Linearly resample a frame-major array, preserving its trailing dimensions."""
+	values = np.asarray(values)
+	if len(values) == frame_count:
+		return values.copy()
+	old_t = np.linspace(0.0, 1.0, len(values))
+	new_t = np.linspace(0.0, 1.0, frame_count)
+	flat = values.reshape(len(values), -1)
+	out = np.empty((frame_count, flat.shape[1]), dtype=float)
+	for column in range(flat.shape[1]):
+		out[:, column] = np.interp(new_t, old_t, flat[:, column])
+	return out.reshape((frame_count,) + values.shape[1:])
+
+
+def overlay_blender_clip(samples, scalars, source_mi, overlay_mi):
+	"""Put Blender-exported channels into the original full-track sample arrays."""
+	frames = int(overlay_mi.frame_count)
+	samples = resample_frames(samples, frames)
+	keys = overlay_mi.keys
+	for data_attr, map_attr, low, high in (
+			("ori_bones", "ori_channel_to_bone", 0, 4),
+			("pos_bones", "pos_channel_to_bone", 4, 7),
+			("scl_bones", "scl_channel_to_bone", 7, 10)):
+		data = np.asarray(getattr(keys, data_attr))
+		for channel, track in enumerate(getattr(keys, map_attr)):
+			samples[:, int(track), low:high] = data[:, channel]
+
+	if scalars is not None:
+		scalars = resample_frames(scalars, frames)
+		source_names = [str(name) for name in source_mi.keys.floats_names]
+		overlay_names = [str(name) for name in keys.floats_names]
+		for overlay_channel, name in enumerate(overlay_names):
+			if name in source_names:
+				scalars[:, source_names.index(name), 0] = keys.floats[:, overlay_channel]
+	return samples, scalars
+
+
+def build_block(mani_info, keys, names_lut, samples, scalars, drop_scale=False,
+				frame_count=None, omit_shear=False, scale_remap=None):
 	"""Serialise one uncompressed ManiBlock."""
-	frames = int(mani_info.frame_count)
+	frames = int(mani_info.frame_count if frame_count is None else frame_count)
 	pos_n, ori_n = int(mani_info.pos_bone_count), int(mani_info.ori_bone_count)
-	scl_n, flo_n = int(mani_info.scl_bone_count), int(mani_info.float_count)
+	scl_n = 0 if drop_scale else int(mani_info.scl_bone_count)
+	flo_n = int(mani_info.float_count)
 	out = bytearray()
 
-	for attr in ("pos_bones_names", "ori_bones_names", "scl_bones_names", "floats_names"):
-		for name in getattr(keys, attr):
+	name_attrs = ["pos_bones_names", "ori_bones_names"]
+	if not drop_scale:
+		name_attrs.append("scl_bones_names")
+	name_attrs.append("floats_names")
+	for attr in name_attrs:
+		names = [str(name) for name in getattr(keys, attr)]
+		if attr == "scl_bones_names" and scale_remap:
+			for channel, (_, name) in scale_remap.items():
+				names[channel] = name
+		for name in names:
 			out += struct.pack("<I", names_lut[str(name)])
 
 	pos_map = [int(x) for x in keys.pos_channel_to_bone]
 	ori_map = [int(x) for x in keys.ori_channel_to_bone]
-	scl_map = [int(x) for x in keys.scl_channel_to_bone]
+	original_scl_map = [int(x) for x in keys.scl_channel_to_bone]
+	scl_map = [] if drop_scale else original_scl_map.copy()
+	if scale_remap and not drop_scale:
+		for channel, (track, _) in scale_remap.items():
+			scl_map[channel] = track
 	for values in (pos_map, ori_map, scl_map):
 		out += bytes(values)
 
-	for attr, low, high in (
+	bone_to_channel_fields = [
 			("pos_bone_to_channel", mani_info.pos_bone_min, mani_info.pos_bone_max),
-			("ori_bone_to_channel", mani_info.ori_bone_min, mani_info.ori_bone_max),
-			("scl_bone_to_channel", mani_info.scl_bone_min, mani_info.scl_bone_max)):
+			("ori_bone_to_channel", mani_info.ori_bone_min, mani_info.ori_bone_max)]
+	if not drop_scale:
+		bone_to_channel_fields.append(
+			("scl_bone_to_channel", mani_info.scl_bone_min, mani_info.scl_bone_max))
+	for attr, low, high in bone_to_channel_fields:
 		if int(low) <= int(high):
-			out += bytes(int(x) & 0xFF for x in getattr(keys, attr))
+			values = [int(x) & 0xFF for x in getattr(keys, attr)]
+			if attr == "scl_bone_to_channel" and scale_remap:
+				for channel, (track, _) in scale_remap.items():
+					old_track = original_scl_map[channel]
+					if not int(low) <= track <= int(high):
+						raise ValueError(
+							f"remapped scale track {track} is outside "
+							f"ManiInfo range {int(low)}..{int(high)}")
+					values[old_track - int(low)] = 255
+					values[track - int(low)] = channel
+			out += bytes(values)
 	out += b"\x00" * pad_to(len(out), 4)
 
 	usable = min(frames, samples.shape[0])
@@ -119,11 +192,25 @@ def build_block(mani_info, keys, names_lut, samples, scalars):
 		ori[:usable, channel] = np.rint(quantised).astype("<i2")
 	for channel, track in enumerate(scl_map):
 		scl[:usable, channel] = samples[:usable, track, 7:10]
+	# ACL can omit the redundant endpoint while ManiInfo keeps
+	# frame_count = duration * rate + 1. Leaving the extra dtype-0 frame at
+	# zero collapses the skeleton for one rendered frame at the clip boundary.
+	# The compressed runtime clamps past its final sample, so do the same.
+	if usable and usable < frames:
+		pos[usable:] = pos[usable - 1]
+		ori[usable:] = ori[usable - 1]
+		scl[usable:] = scl[usable - 1]
 	if scalars is not None and flo_n:
 		n = min(flo_n, scalars.shape[1])
-		flo[:usable, :n] = scalars[:usable, :n, 0]
+		float_usable = min(frames, scalars.shape[0])
+		flo[:float_usable, :n] = scalars[:float_usable, :n, 0]
+		if float_usable and float_usable < frames:
+			flo[float_usable:] = flo[float_usable - 1]
 
-	out += pos.tobytes() + ori.tobytes() + shr.tobytes() + scl.tobytes() + flo.tobytes()
+	out += pos.tobytes() + ori.tobytes()
+	if not omit_shear:
+		out += shr.tobytes()
+	out += scl.tobytes() + flo.tobytes()
 	out += b"\x00" * pad_to(len(out), 8)
 	return bytes(out)
 
@@ -137,7 +224,45 @@ def main():
 	ap.add_argument("--yaw-clip", type=int)
 	ap.add_argument("--yaw-track", type=int)
 	ap.add_argument("--yaw-deg", type=float, default=60.0)
+	ap.add_argument("--drop-scale", action="store_true",
+					help="experimental control: omit scale tables using shipped no-scale conventions")
+	ap.add_argument("--omit-shear", action="store_true",
+					help="JWE3 experiment: retain SclBones but omit the DLA/PZ ShrBones block")
+	ap.add_argument("--overlay",
+					help="Blender-exported dtype-0 MANIS whose named clips replace source samples")
+	ap.add_argument("--overlay-clip", action="append", default=[],
+					help="clip name (or unique suffix) to take from --overlay; repeatable")
+	ap.add_argument("--scale-clip", action="append", default=[],
+					help="clip name (or suffix) whose decoded scale samples are multiplied; repeatable")
+	ap.add_argument("--scale-track", action="append", type=int, default=[],
+					help="skeleton track index to scale in --scale-clip; repeatable")
+	ap.add_argument("--scale-factor", type=float, default=1.0,
+					help="multiplier applied to selected decoded scale samples")
+	ap.add_argument("--scale-value", type=float,
+					help="set selected scale samples to this constant instead of multiplying")
+	ap.add_argument("--remap-scale-channel", action="append", default=[],
+					metavar="CHANNEL:TRACK:NAME",
+					help="in --scale-clip, retarget one existing scale channel")
+	ap.add_argument("--promote-scale-related", action="store_true",
+					help="JWE3 experiment: for --scale-clip, copy the active orientation "
+						 "related/repeat metadata into the scale fields")
 	args = ap.parse_args()
+	if args.drop_scale and args.omit_shear:
+		ap.error("--drop-scale and --omit-shear are mutually exclusive")
+	if bool(args.scale_clip) != bool(args.scale_track):
+		ap.error("--scale-clip and --scale-track must be supplied together")
+	scale_remap = {}
+	for value in args.remap_scale_channel:
+		try:
+			channel_text, track_text, name = value.split(":", 2)
+			channel, track = int(channel_text), int(track_text)
+		except ValueError:
+			ap.error(f"invalid --remap-scale-channel {value!r}; expected CHANNEL:TRACK:NAME")
+		scale_remap[channel] = (track, name)
+	if scale_remap and not args.scale_clip:
+		ap.error("--remap-scale-channel requires --scale-clip")
+	if args.promote_scale_related and not args.scale_clip:
+		ap.error("--promote-scale-related requires --scale-clip")
 
 	raw = open(args.manis, "rb").read()
 	headers = [read_blob_header(raw, offset) for offset, _ in list_clip_blobs(raw)]
@@ -147,6 +272,18 @@ def main():
 
 	manis = ManisFile()
 	manis.load(args.manis)
+	overlay_lut = {}
+	if args.overlay:
+		overlay = ManisFile()
+		overlay.load(args.overlay)
+		for overlay_mi in overlay.mani_infos:
+			name = str(overlay_mi.name)
+			if not args.overlay_clip or any(
+					name == wanted or name.endswith(wanted) for wanted in args.overlay_clip):
+				overlay_lut[name] = overlay_mi
+		if args.overlay_clip and len(overlay_lut) != len(args.overlay_clip):
+			raise ValueError(
+				f"resolved {len(overlay_lut)} overlay clips for {len(args.overlay_clip)} requests")
 	count = len(manis.mani_infos)
 	print(f"{os.path.basename(args.manis)}: {count} clips, "
 		  f"{len(transforms)} transform streams")
@@ -169,6 +306,27 @@ def main():
 		at = index * MANI_INFO_SIZE + DTYPE_OFFSET
 		dtype, = struct.unpack_from("<I", infos, at)
 		struct.pack_into("<I", infos, at, dtype & ~(COMPRESSION_BIT | HAS_LIST_MASK))
+		overlay_mi = overlay_lut.get(str(manis.mani_infos[index].name))
+		if overlay_mi is not None:
+			struct.pack_into("<f", infos, index * MANI_INFO_SIZE, float(overlay_mi.duration))
+			struct.pack_into("<I", infos, index * MANI_INFO_SIZE + 4,
+						 int(overlay_mi.frame_count))
+		if args.drop_scale:
+			# Shipped no-scale ManiInfos use count=0, min=255, max=0. The dtype-0
+			# scale layout has never been game-verified; this control isolates it.
+			infos[index * MANI_INFO_SIZE + 28] = 0
+			infos[index * MANI_INFO_SIZE + 284] = 255
+			infos[index * MANI_INFO_SIZE + 285] = 0
+		if args.promote_scale_related and any(
+				str(manis.mani_infos[index].name) == wanted
+				or str(manis.mani_infos[index].name).endswith(wanted)
+				for wanted in args.scale_clip):
+			base = index * MANI_INFO_SIZE
+			infos[base + SCL_RELATED_OFFSET] = infos[base + ORI_RELATED_OFFSET]
+			infos[base + SCL_REPEAT_OFFSET] = infos[base + ORI_REPEAT_OFFSET]
+			print(f"  metadata: {manis.mani_infos[index].name} scale related/repeat "
+				  f"promoted to {infos[base + SCL_RELATED_OFFSET]}/"
+				  f"{infos[base + SCL_REPEAT_OFFSET]}")
 	buffer0 = bytes(infos)
 
 	# buffer 1: the name/hash table, untouched
@@ -180,6 +338,22 @@ def main():
 	for clip, mani_info in enumerate(manis.mani_infos):
 		blob = transforms[clip]
 		samples = fill_defaults(streams[blob].values, bind)
+		if args.scale_clip and any(
+				str(mani_info.name) == wanted or str(mani_info.name).endswith(wanted)
+				for wanted in args.scale_clip):
+			clip_scale_remap = scale_remap
+			for track in args.scale_track:
+				if not 0 <= track < samples.shape[1]:
+					raise ValueError(f"scale track {track} is outside 0..{samples.shape[1] - 1}")
+				if args.scale_value is None:
+					samples[:, track, 7:10] *= args.scale_factor
+				else:
+					samples[:, track, 7:10] = args.scale_value
+			operation = (f"set to {args.scale_value:g}" if args.scale_value is not None
+						 else f"multiplied by {args.scale_factor:g}")
+			print(f"  edit: {mani_info.name} scale tracks {args.scale_track} {operation}")
+		else:
+			clip_scale_remap = None
 		if args.yaw_clip == clip and args.yaw_track is not None:
 			samples = yaw(samples, args.yaw_track, args.yaw_deg)
 			print(f"  edit: clip {clip} track {args.yaw_track} "
@@ -187,14 +361,33 @@ def main():
 		scalars = None
 		if blob + 1 < len(streams) and streams[blob + 1].track_type != QVVF:
 			scalars = streams[blob + 1].values
+		overlay_mi = overlay_lut.get(str(mani_info.name))
+		frame_count = None
+		if overlay_mi is not None:
+			samples, scalars = overlay_blender_clip(
+				samples, scalars, mani_info, overlay_mi)
+			frame_count = int(overlay_mi.frame_count)
+			print(f"  overlay: {mani_info.name} ({frame_count} frames)")
 		buffer2 += b"\x00" * pad_to(len(buffer2), 16)
-		buffer2 += build_block(mani_info, mani_info.keys, names_lut, samples, scalars)
+		buffer2 += build_block(
+			mani_info, mani_info.keys, names_lut, samples, scalars,
+			drop_scale=args.drop_scale, frame_count=frame_count,
+			omit_shear=args.omit_shear, scale_remap=clip_scale_remap)
 	buffer2 += b"\x00" * pad_to(len(buffer2), 16)
 
 	with open(args.out, "wb") as fh:
 		fh.write(preamble + buffer0 + buffer1 + bytes(buffer2))
 	print(f"wrote {args.out} ({os.path.getsize(args.out)} bytes; "
 		  f"b0={len(buffer0)} b1={len(buffer1)} b2={len(buffer2)})")
+
+	if args.omit_shear:
+		# Cobra's provisional reader still expects ShrBones, so a cobra round trip is
+		# not a valid gate for this deliberately different layout. The direct builder
+		# has already consumed every source clip and emitted one aligned block per clip.
+		# The game is the falsifier for this experiment.
+		print(f"verify: {count}/{count} blocks emitted; cobra parse intentionally skipped "
+			  "because its schema still expects ShrBones")
+		return 0
 
 	check = ManisFile()
 	check.load(args.out)

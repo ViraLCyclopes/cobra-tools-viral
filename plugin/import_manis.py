@@ -172,7 +172,7 @@ def load(reporter, files=(), filepath="", disable_ik=False, set_fps=False):
 			b_local_inv_mats[bone.name] = get_b_local_matrix(bone).inverted()
 	cam_corr = None
 
-	for mi in manis.mani_infos:
+	for manis_index, mi in enumerate(manis.mani_infos):
 		logging.info(f"Importing {mi.name}")
 		if "_camera" in mi.name:
 			# reuse a camera of the same name instead of leaving a .001 duplicate behind.
@@ -198,6 +198,10 @@ def load(reporter, files=(), filepath="", disable_ik=False, set_fps=False):
 		# without this there is no way to send an edited clip back to the right one - and
 		# lumping every action into a single file is not how the game ships them.
 		b_action["manis"] = manis_name
+		# Preserve the source ManiInfo order. update-in-place requires the child .mani
+		# loaders to remain in exactly the same order, and Blender's NLA action lookup
+		# is set-backed, so action iteration order cannot be used for this.
+		b_action["manis_index"] = manis_index
 		b_action["fps"] = int(round((mi.frame_count-1) / mi.duration))
 		# print(mi)
 		logging.debug(f"Compression = {mi.dtype.compression}")

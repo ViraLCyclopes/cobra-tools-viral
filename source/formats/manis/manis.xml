@@ -441,6 +441,8 @@
 		<field name="PosBones" type="float" arr1="#ARG#\FrameCount" arr2="#ARG#\PosBoneCount" arr3="3" cond="#ARG#\dtype\compression #EQ# 0" />
 		<field name="OriBones" type="normshort" arr1="#ARG#\FrameCount" arr2="#ARG#\OriBoneCount" arr3="4" cond="#ARG#\dtype\compression #EQ# 0" />
 		<!-- found in DLA SpaceMountain animations.manisetd740d135, and PZ crane -->
+		<!-- JWE3 no-ShrBones is currently exposed by the generated reader only via
+		     COBRA_JWE3_NO_SHEAR=1, pending its in-game falsifier. -->
 		<field name="ShrBones" type="float" arr1="#ARG#\FrameCount" arr2="#ARG#\SclBoneCount" arr3="2" cond="#ARG#\dtype\compression #EQ# 0" />
 		<field name="SclBones" type="float" arr1="#ARG#\FrameCount" arr2="#ARG#\SclBoneCount" arr3="3" cond="#ARG#\dtype\compression #EQ# 0" />
 		<!-- JWE3/PC2 stores scalar channels in a second ACL blob when compressed. -->

@@ -1,3 +1,5 @@
+import os
+
 from generated.array import Array
 from generated.base_struct import BaseStruct
 from generated.formats.manis.imports import name_type_map
@@ -101,7 +103,12 @@ class ManiBlock(BaseStruct):
 		if instance.arg.dtype.compression == 0:
 			yield 'pos_bones', Array, (0, None, (instance.arg.frame_count, instance.arg.pos_bone_count, 3,), name_type_map['Float']), (False, None)
 			yield 'ori_bones', Array, (0, None, (instance.arg.frame_count, instance.arg.ori_bone_count, 4,), name_type_map['Normshort']), (False, None)
-			yield 'shr_bones', Array, (0, None, (instance.arg.frame_count, instance.arg.scl_bone_count, 2,), name_type_map['Float']), (False, None)
+			# Opt-in reader/writer for the JWE3 dtype-0 scale-layout experiment.
+			# DLA and PZ evidence ShrBones; runtime disassembly shows JWE3 does not
+			# expect that block before SclBones. Keep the legacy default until the
+			# game test supplies the external format proof.
+			if os.environ.get('COBRA_JWE3_NO_SHEAR') != '1':
+				yield 'shr_bones', Array, (0, None, (instance.arg.frame_count, instance.arg.scl_bone_count, 2,), name_type_map['Float']), (False, None)
 			yield 'scl_bones', Array, (0, None, (instance.arg.frame_count, instance.arg.scl_bone_count, 3,), name_type_map['Float']), (False, None)
 			yield 'floats', Array, (0, None, (instance.arg.frame_count, instance.arg.float_count,), name_type_map['Float']), (False, None)
 		if not ((instance.context.version == 262) and (instance.context.mani_version == 282)) and instance.arg.dtype.compression > 0:

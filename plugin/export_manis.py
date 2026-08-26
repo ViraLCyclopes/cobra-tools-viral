@@ -93,7 +93,8 @@ def collect_export_map(scene, manis_name, per_armature=False, export_mode="SOURC
 	return manis_datas, unstamped
 
 
-def save(reporter, filepath="", per_armature=False, export_mode="SOURCE"):
+def save(reporter, filepath="", per_armature=False, export_mode="SOURCE",
+		 jwe3_scale_mode="OMIT"):
 	"""Export actions to .manis.
 
 	`export_mode` decides how actions are grouped into files:
@@ -112,6 +113,13 @@ def save(reporter, filepath="", per_armature=False, export_mode="SOURCE"):
 	"""
 	folder, manis_name = os.path.split(filepath)
 	scene = bpy.context.scene
+	drop_jwe3_scale = (
+		scene.cobra.game == "Jurassic World Evolution 3"
+		and jwe3_scale_mode == "OMIT")
+	if scene.cobra.game == "Jurassic World Evolution 3" and not drop_jwe3_scale:
+		reporter.show_warning(
+			"Experimental JWE3 scale export is enabled. Current dtype-0 scale blocks "
+			"are game-verified to crash dinosaur bundles.")
 	bpy.ops.object.mode_set(mode='OBJECT')
 	manis_datas, unstamped = collect_export_map(scene, manis_name, per_armature, export_mode)
 	if unstamped:
@@ -123,15 +131,28 @@ def save(reporter, filepath="", per_armature=False, export_mode="SOURCE"):
 	for export_name, anim_map in manis_datas.items():
 		manis = ManisFile()
 		set_game(manis, scene.cobra.game)
-		all_actions = [action for actions in anim_map.values() for action in actions]
+		# Preserve the ManiInfo order stamped by the importer. Blender's action/NLA
+		# collection is set-backed, but OVL update-in-place requires the child .mani
+		# loaders to stay in their original order. Name is a deterministic fallback for
+		# older scenes imported before the index property existed.
+		def source_order(action):
+			return (get_property(action, "manis_index", default=2 ** 31), action.name)
+		all_actions = [
+			action
+			for actions in anim_map.values()
+			for action in sorted(actions, key=source_order)
+		]
 		manis.mani_count = len(all_actions)
 		manis.reset_field("mani_infos")
 		manis.reset_field("keys_buffer")
 		info_lut = {action: mani_info for action, mani_info in zip(all_actions, manis.mani_infos)}
 		# export each armature and its actions to the corresponding mani_infos
 		for b_ob, actions in anim_map.items():
+			actions = sorted(actions, key=source_order)
 			mani_infos = [info_lut[action] for action in actions]
-			export_actions(b_ob, actions, manis, mani_infos, folder, scene)
+			export_actions(
+				b_ob, actions, manis, mani_infos, folder, scene,
+				drop_scale=drop_jwe3_scale)
 
 		filepath = os.path.join(folder, export_name)
 		manis.save(filepath)
@@ -141,7 +162,7 @@ def needs_wsm(bone, game):
 	# todo identify additional condition for this; it is not motionextracted vs notmotionextracted
 	return bone == srb_name and game == "Jurassic World Evolution 2"
 
-def export_actions(b_ob, actions, manis, mani_infos, folder, scene):
+def export_actions(b_ob, actions, manis, mani_infos, folder, scene, drop_scale=False):
 	corrector = ManisCorrector(False)
 	game = scene.cobra.game
 	b_local_mats = {}
@@ -258,6 +279,14 @@ def export_actions(b_ob, actions, manis, mani_infos, folder, scene):
 						# original sensor width
 						keys = 2 * np.arctan(36 / (2*keys))
 						channel_storage["CameraFOV"] = {FLO: keys}
+
+		# JWE3's current dtype-0 dinosaur reader is game-verified to reject scale
+		# tables. Imported source actions can carry scale even when the one action the
+		# user edited does not, so this must apply to every clip in every output bundle.
+		# JWE2 keeps its historical scale export behavior.
+		if drop_scale:
+			for channels in channel_storage.values():
+				channels.pop(SCL, None)
 
 		# print(channel_storage)
 		pos_names = set_mani_info_counts(mani_info, channel_storage, POS)
