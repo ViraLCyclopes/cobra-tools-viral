@@ -140,9 +140,32 @@ class ManisLoader(MemStructLoader):
 		wanted_children = [f"{name}.mani" for name in manis_file.names]
 		current_children = [child.name for child in self.children]
 		if wanted_children != current_children:
-			raise ValueError(
-				f"{self.name}: has {len(current_children)} animations but the new file "
-				f"has {len(wanted_children)}; cannot update in place")
+			# Appending clips is supported: the existing ones keep their order and
+			# their loaders, and only the new names need a loader created. Anything
+			# else - a removal, a rename, a reorder - would orphan or re-point an
+			# existing .mani child, so it still refuses rather than half-applying.
+			appended = wanted_children[len(current_children):]
+			if wanted_children[:len(current_children)] != current_children or not appended:
+				raise ValueError(
+					f"{self.name}: has {len(current_children)} animations and the new "
+					f"file has {len(wanted_children)}; only appended clips can be "
+					f"updated in place, not removals, renames or reordering")
+			folder = os.path.dirname(file_path)
+			# Put the new .mani in the same archive as its siblings, not the
+			# create_file default of STATIC.
+			sibling_ovs = self.children[0].ovs_name if self.children else self.ovs_name
+			for mani_name in appended:
+				child = self.ovl.create_file(
+					os.path.join(folder, mani_name), mani_name, ovs_name=sibling_ovs)
+				if child is None:
+					raise ValueError(f"{self.name}: could not create {mani_name}")
+				# create_file only builds the loader; rebuild_ovl_arrays walks
+				# ovl.loaders, and a loader missing from it never receives a
+				# root_index, which the parent-to-children asset map then needs.
+				self.ovl.loaders[child.name] = child
+				self.children.append(child)
+			logging.info(f"{self.name}: added {len(appended)} new animation(s) in "
+						 f"{sibling_ovs}: {', '.join(appended)}")
 
 		statics, extra = self._buffer_layout(manis_file, b0, b1, b2, externals)
 		wanted_entries = {self.ovs_name} | {ovs_name for ovs_name, _ in extra}

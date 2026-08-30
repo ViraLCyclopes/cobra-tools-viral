@@ -1,4 +1,4 @@
-"""Rebuild a JWE3 .manis with a real ACL database (Approach E).
+﻿"""Rebuild a JWE3 .manis with a real ACL database (Approach E).
 
 The game rejects self-contained clips. Re-encoding every clip with
 has_database = false crashes on spawn whether the original database is kept or removed,
@@ -27,11 +27,12 @@ import tempfile
 import numpy as np
 
 from generated.formats.manis.acl import decode_file, encode_tracks, decode_blob, _write_jacl
-from source.formats.manis.bindpose import read_ms2_bind, bind_bytes
+from source.formats.manis.bindpose import (
+	bind_bytes, clip_defaults, extend_bind_pose, read_ms2_bind, write_jbind)
 from source.formats.manis.database import find_database, read_bulk_info, locate_bulk
+from source.formats.manis.limbs import block_layout, buffer_residue, rebuild_block
 from source.formats.manis.selfcontained import count_parsed_maniblocks
-from source.formats.manis.splice import (
-	blob_alignments, list_clip_blobs, read_blob_header, ref_alignment, replace_blob)
+from source.formats.manis.splice import list_clip_blobs, read_blob_header
 
 QVVF = 12
 BULK_ALIGNMENT = 16
@@ -51,7 +52,8 @@ def pad_to(data, alignment=BULK_ALIGNMENT):
 	return data if not over else data + b"\x00" * (alignment - over)
 
 
-def build_database(streams, headers, bind, work_dir, precision=None):
+def build_database(streams, headers, bind, work_dir, parents, bind_values,
+				   precision=None, medium_proportion=None, low_proportion=None):
 	"""Run the ACL database builder over every transform clip.
 
 	Returns (bound_blobs_by_stream_index, database_bytes, low_bulk, medium_bulk).
@@ -61,9 +63,20 @@ def build_database(streams, headers, bind, work_dir, precision=None):
 	for index, stream in enumerate(streams):
 		if stream.track_type != QVVF:
 			continue
-		jacl = os.path.join(work_dir, f"clip.{len(order)}.jacl")
+		slot = len(order)
+		jacl = os.path.join(work_dir, f"clip.{slot}.jacl")
 		_write_jacl(jacl, stream.values, stream.track_type, stream.sample_rate)
-		manifest_lines.append(f"{jacl}|{1 if headers[index]['wrap_optimized'] else 0}")
+		# Defaults are per clip, not per bundle: they decide which sub-tracks ACL
+		# strips, and a stripped sub-track is filled in by the game rather than by
+		# the file. clip_defaults() derives them from the vanilla decode so the
+		# stripped set comes out identical to what Frontier shipped.
+		clip_bind = os.path.join(work_dir, f"clip.{slot}.jbind")
+		tracks = stream.values.shape[1]
+		clip_parents = parents[:tracks]
+		write_jbind(clip_bind, clip_parents,
+					clip_defaults(stream.values, bind_values))
+		manifest_lines.append(
+			f"{jacl}|{1 if headers[index]['wrap_optimized'] else 0}|{clip_bind}")
 		order.append(index)
 	if not order:
 		sys.exit("no transform clips in this bundle; nothing to build a database from")
@@ -84,6 +97,10 @@ def build_database(streams, headers, bind, work_dir, precision=None):
 	command = [builder, manifest, out_dir, "--bind", bind_file]
 	if precision is not None:
 		command += ["--precision", repr(precision)]
+	if medium_proportion is not None:
+		command += ["--medium", repr(medium_proportion)]
+	if low_proportion is not None:
+		command += ["--low", repr(low_proportion)]
 	result = subprocess.run(command, check=False, capture_output=True, text=True)
 	if result.returncode != 0:
 		sys.exit(f"ACL database build failed: {result.stderr.strip() or result.stdout.strip()}")
@@ -142,6 +159,245 @@ def apply_yaw(streams, headers, bind, clip, track, degrees):
 	return streams
 
 
+def scale_motion_track(manis_path, streams, headers, clip_name, factor):
+	"""Multiply one clip's 'Z Motion Track' scalar, its baked world displacement.
+
+	Locomotion clips are motion-extracted: the root motion is not in the transform
+	tracks, it is this scalar curve, and the engine advances the entity along it.
+	That is why playing a clip faster does not make the animal travel further - the
+	declared distance is unchanged, so the entity is moved the same amount and
+	re-synchronised.
+
+	Scaling is applied as a delta from the curve's first sample, so the clip still
+	starts where it started and only the distance covered changes.
+	"""
+	from generated.formats.manis import ManisFile
+
+	manis = ManisFile()
+	manis.load(manis_path)
+	transforms = [i for i, h in enumerate(headers) if h["track_type"] == QVVF]
+	for order, info in enumerate(manis.mani_infos):
+		if info.name != clip_name:
+			continue
+		names = [str(n) for n in getattr(info.keys, "floats_names", [])]
+		if "Z Motion Track" not in names:
+			sys.exit(f"clip '{clip_name}' has no 'Z Motion Track' channel; it is not "
+					 f"motion-extracted. Channels: {names}")
+		channel = names.index("Z Motion Track")
+		# the scalar stream sits immediately after its clip's transform stream
+		index = transforms[order] + 1
+		if index >= len(streams) or streams[index].track_type == QVVF:
+			sys.exit(f"clip '{clip_name}' has no scalar stream to edit")
+		values = streams[index].values.copy()
+		column = values[:, channel, 0]
+		finite = np.isfinite(column)
+		if not finite.any():
+			sys.exit(f"clip '{clip_name}' Z Motion Track is empty")
+		origin = column[finite][0]
+		before = float(column[finite][-1] - origin)
+		values[:, channel, 0] = np.where(
+			finite, origin + (column - origin) * factor, column)
+		streams[index].values = values
+		after = before * factor
+		print(f"  motion: '{clip_name}' travel {before:.3f} -> {after:.3f} "
+			  f"over {info.duration:.4f}s  ({before / info.duration:.2f} -> "
+			  f"{after / info.duration:.2f} m/s)")
+		print(f"  set SpeciesAnimation.WalkSpeed/RunSpeed to {after / info.duration:.2f} "
+			  f"to keep the engine's reference in step")
+		return streams
+	sys.exit(f"no clip named '{clip_name}' in this bundle")
+
+
+def resample_clip(manis_path, streams, headers, clip_name, factor):
+	"""Genuinely shorten a clip by dropping frames, not by lying about its timing.
+
+	Every other way of speeding a clip up desynchronises two fields that must
+	agree. `ManiInfo.duration` is what the state machine schedules against;
+	`sample_rate` is how ACL maps time to sample index. Editing duration alone
+	changes nothing but the transition; editing sample_rate makes the decoder run
+	off the end of the clip and the entity twitches even while the game is PAUSED.
+	The motiongraph `speed` field works but leaves duration stale, and the state
+	then exits by an edge it should never reach - the Acrocanthosaurus charge.
+
+	Resampling avoids all of it: keep sample_rate, keep the authored motion, just
+	store fewer frames. The caller must then set ManiInfo frame_count and duration
+	to match, so num_samples / sample_rate == duration and nothing is inconsistent.
+
+	factor 0.5 halves the frames, so the clip plays twice as fast.
+	"""
+	from generated.formats.manis import ManisFile
+
+	if not 0.05 <= factor <= 1.0:
+		sys.exit(f"resample factor {factor} outside 0.05..1.0; only shortening is supported")
+	manis = ManisFile()
+	manis.game = "Jurassic World Evolution 3"
+	manis.load(manis_path)
+	transforms = [i for i, h in enumerate(headers) if h["track_type"] == QVVF]
+	names = [str(i.name) for i in manis.mani_infos]
+	if clip_name not in names:
+		sys.exit(f"no clip named '{clip_name}' in this bundle")
+	order = names.index(clip_name)
+	first = transforms[order]
+	targets = [first]
+	if first + 1 < len(headers) and headers[first + 1]["track_type"] != QVVF:
+		targets.append(first + 1)
+
+	before = streams[first].values.shape[0]
+	keep = np.unique(np.rint(np.linspace(0, before - 1,
+										 max(2, int(round(before * factor))))).astype(int))
+	for index in targets:
+		streams[index].values = streams[index].values[keep]
+	rate = streams[first].sample_rate
+	samples = len(keep)
+
+	# Measured across all 22 clips of Acro's idle bundle, exactly:
+	#   wrap_optimized : frame_count = samples + 1, duration = samples / rate
+	#   not wrapped    : frame_count = samples,     duration = (samples - 1) / rate
+	# A wrap-optimised clip's final frame is implicit and equal to its first, which
+	# is why it declares one more frame than it stores.
+	wrap = headers[first]["wrap_optimized"]
+	frame_count = samples + 1 if wrap else samples
+	duration = (samples if wrap else samples - 1) / rate
+	print(f"  resample: '{clip_name}' {before} -> {samples} samples "
+		  f"at an unchanged {rate:.4f} fps  (wrap_optimized={wrap})")
+	return streams, frame_count, duration
+
+
+def retime_mani_info(data, clip_name, frames, duration):
+	"""Write a resampled clip's new frame_count and duration into its ManiInfo.
+
+	ManiInfo is 304 bytes: duration is a float at +0, frame_count a uint32 at +4.
+	Both have to match the resampled blob, because they are read by different
+	consumers - duration by the state machine, the sample count by ACL - and the
+	whole point of resampling is that nothing disagrees.
+	"""
+	import struct
+
+	from generated.formats.manis import ManisFile
+	from modules.helpers import as_bytes
+
+	# ManisFile has no bytes loader, so round-trip through a scratch file to get the
+	# parsed preamble size; the byte offsets are then checked against what it decoded
+	with tempfile.NamedTemporaryFile(suffix=".manis", delete=False) as tmp:
+		tmp.write(data)
+		scratch = tmp.name
+	try:
+		manis = ManisFile()
+		manis.game = "Jurassic World Evolution 3"
+		manis.load(scratch)
+		names = [str(i.name) for i in manis.mani_infos]
+		if clip_name not in names:
+			sys.exit(f"cannot retime '{clip_name}': not in the rebuilt bundle")
+		index = names.index(clip_name)
+		size = 8 + len(as_bytes(str(manis.stream or "")))
+		for name in manis.names:
+			size += len(as_bytes(str(name)))
+		size += len(as_bytes(manis.header))
+		base = size + index * 304
+		out = bytearray(data)
+		was_duration = struct.unpack_from("<f", out, base)[0]
+		was_frames = struct.unpack_from("<I", out, base + 4)[0]
+		if abs(was_duration - float(manis.mani_infos[index].duration)) > 1e-6:
+			sys.exit(f"ManiInfo offset check failed for {clip_name}: bytes say "
+					 f"{was_duration}, parser says {manis.mani_infos[index].duration}")
+		struct.pack_into("<f", out, base, duration)
+		struct.pack_into("<I", out, base + 4, frames)
+		print(f"  ManiInfo: '{clip_name}' duration {was_duration:.4f} -> {duration:.4f}s, "
+			  f"frame_count {was_frames} -> {frames}")
+		return bytes(out)
+	finally:
+		os.unlink(scratch)
+
+
+def read_jacl(path):
+	"""Read a JACL sample array - the interchange the Blender exporter writes."""
+	import struct as _struct
+
+	with open(path, "rb") as fh:
+		raw = fh.read()
+	if len(raw) < 28 or raw[:4] != b"JACL":
+		sys.exit(f"{path} is not a JACL file")
+	_version, track_type, tracks, samples, comps = _struct.unpack_from("<IIIII", raw, 4)
+	rate, = _struct.unpack_from("<f", raw, 24)
+	need = samples * tracks * comps
+	values = np.frombuffer(raw, dtype="<f4", count=need, offset=28)
+	return values.reshape(samples, tracks, comps).copy(), track_type, rate
+
+
+def replace_clip_samples(manis_path, streams, headers, clip_name, jacl_path):
+	"""Swap one clip's animation for samples authored outside the game.
+
+	This is the Blender export path. The bundle is NOT rebuilt from scratch -
+	`ManisFile.save()` would drop the ACL database, the compressed blobs and the
+	limb data, and it can only write uncompressed dtype 0, which the charge bug and
+	the 9x size blowup make unusable. Instead the vanilla bundle stays the template
+	and one clip's samples are replaced inside it, so every ManiInfo, channel map,
+	name table and limb structure is carried through untouched.
+
+	The track count must match: a clip's channel list lives in the resident
+	ManiBlock, and growing it is a different (unsolved) problem. Sample COUNT may
+	differ - that is a retime, and the caller fixes frame_count and duration.
+	"""
+	from generated.formats.manis import ManisFile
+
+	manis = ManisFile()
+	manis.game = "Jurassic World Evolution 3"
+	manis.load(manis_path)
+	names = [str(i.name) for i in manis.mani_infos]
+	if clip_name not in names:
+		sys.exit(f"no clip named '{clip_name}' in this bundle. Available: {names}")
+	order = names.index(clip_name)
+	transforms = [i for i, h in enumerate(headers) if h["track_type"] == QVVF]
+	index = transforms[order]
+
+	values, track_type, rate = read_jacl(jacl_path)
+	if track_type != QVVF:
+		sys.exit(f"{jacl_path} holds track type {track_type}, expected {QVVF} (qvvf)")
+	have = streams[index].values.shape[1]
+	if values.shape[1] != have:
+		sys.exit(f"'{clip_name}' has {have} tracks, {os.path.basename(jacl_path)} has "
+				 f"{values.shape[1]}. The channel list is fixed by the resident "
+				 f"ManiBlock; export against this clip's own skeleton.")
+	before = streams[index].values.shape[0]
+
+	# Blender has no concept of a stripped sub-track: every bone always has a pose,
+	# so a .jacl exported from it is fully dense. Storing all of that would change
+	# the stripped set, which is a CONTRACT with the runtime - the game supplies
+	# stripped values itself, and storing more than vanilla did is what makes
+	# animals crush and stretch (see ACL_REENCODE_2026-08-29.md section 3).
+	# So re-apply the template's NaN mask: whatever Frontier left to the game stays
+	# left to the game. The consequence is that a bone vanilla never stored cannot
+	# be animated by this path.
+	template = streams[index].values
+	incoming = values
+	if incoming.shape[0] == template.shape[0]:
+		mask = np.isnan(template)
+	else:
+		# retimed: resample the mask along time, nearest sample
+		src = np.rint(np.linspace(0, template.shape[0] - 1, incoming.shape[0])).astype(int)
+		mask = np.isnan(template)[src]
+	dropped = int((mask & ~np.isnan(incoming)).sum())
+	incoming = np.where(mask, np.float32("nan"), incoming)
+	if dropped:
+		print(f"           {dropped} components discarded to preserve the vanilla "
+			  f"stripped set ({mask.mean():.1%} of the clip is game-supplied)")
+	streams[index].values = incoming
+	wrap = headers[index]["wrap_optimized"]
+	samples = values.shape[0]
+	frame_count = samples + 1 if wrap else samples
+	duration = (samples if wrap else samples - 1) / streams[index].sample_rate
+	print(f"  replace: '{clip_name}' {before} -> {samples} samples from "
+		  f"{os.path.basename(jacl_path)}")
+	if samples == before:
+		# Same length, so the clip's declared timing is already correct. Rewriting it
+		# from samples/rate would round differently and change bytes for no reason;
+		# a pure sample swap must leave every other field untouched.
+		return streams, None, None
+	print(f"           sample count changed, so ManiInfo follows: "
+		  f"frame_count {frame_count}, duration {duration:.4f}s")
+	return streams, frame_count, duration
+
+
 def main():
 	ap = argparse.ArgumentParser(description=__doc__,
 								 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -152,10 +408,37 @@ def main():
 	ap.add_argument("--precision", type=float,
 					help="ACL error threshold in cm; looser values avoid the raw bit rate "
 						 "(index 31 in the stream) that vanilla never uses")
+	ap.add_argument("--medium", type=float,
+					help="fraction of keyframes moved to the medium-importance tier "
+						 "(ACL default 0.35). The tiers are the game's LOD streams - low "
+						 "goes to Anim_L0 and medium to Anim_L1 - so a clip whose keys are "
+						 "mostly streamed reconstructs badly at distance. These clips animate "
+						 "bone TRANSLATION, so that shows up as stretched limbs, not just a "
+						 "soft pose. Lower both to keep more keyframes resident.")
+	ap.add_argument("--low", type=float,
+					help="fraction of keyframes moved to the lowest-importance tier "
+						 "(ACL default 0.5); see --medium")
 	ap.add_argument("--yaw-clip", type=int,
 					help="clip index to rotate, for proving an edit reaches the game")
 	ap.add_argument("--yaw-track", type=int, help="track (== .ms2 bone index) to rotate")
 	ap.add_argument("--yaw-deg", type=float, default=60.0, help="degrees to rotate")
+	ap.add_argument("--motion-clip", type=str,
+					help="clip NAME whose 'Z Motion Track' scalar channel to scale, e.g. "
+						 "acrocanthosaurus$walk. That channel is how far the clip carries "
+						 "the animal, which is the number SpeciesAnimation.WalkSpeed is "
+						 "meant to agree with - Acrocanthosaurus' walk clip measures "
+						 "4.33 m/s against a declared 4.32.")
+	ap.add_argument("--motion-factor", type=float, default=2.0,
+					help="multiplier for --motion-clip (default 2.0)")
+	ap.add_argument("--resample-clip", type=str,
+					help="clip NAME to shorten by dropping frames - the only way to "
+						 "speed a clip up that keeps every timing field consistent")
+	ap.add_argument("--resample-factor", type=float, default=0.5,
+					help="fraction of frames to keep (default 0.5 = twice as fast)")
+	ap.add_argument("--replace-clip", type=str,
+					help="clip NAME whose samples to replace from --jacl (Blender export)")
+	ap.add_argument("--jacl", type=str,
+					help="JACL sample file to read for --replace-clip")
 	args = ap.parse_args()
 
 	with open(args.manis, "rb") as fh:
@@ -176,26 +459,55 @@ def main():
 
 	parents, bind_values = read_ms2_bind(args.ms2)
 	print(f"  bind pose: {len(parents)} bones from {os.path.basename(args.ms2)}")
+	# One bind serves every clip in the bundle, so it has to cover the longest.
+	# Clips authored on a bigger rig are normal here - see extend_bind_pose.
+	widest = max((stream.values.shape[1] for stream in streams
+				  if stream.track_type == QVVF), default=0)
+	if widest > len(parents):
+		parents, bind_values = extend_bind_pose(parents, bind_values, widest)
+		print(f"  padded bind to {widest} tracks for clips authored on a larger rig")
 	bind = bind_bytes(parents, bind_values)
 
 	if args.yaw_clip is not None and args.yaw_track is not None:
 		streams = apply_yaw(streams, headers, bind_values, args.yaw_clip,
 							args.yaw_track, args.yaw_deg)
 
+	if args.motion_clip:
+		streams = scale_motion_track(args.manis, streams, headers,
+									 args.motion_clip, args.motion_factor)
+
+	resampled = None
+	if args.replace_clip:
+		if not args.jacl:
+			sys.exit("--replace-clip needs --jacl")
+		streams, resampled, new_duration = replace_clip_samples(
+			args.manis, streams, headers, args.replace_clip, args.jacl)
+
+	if args.resample_clip:
+		streams, resampled, new_duration = resample_clip(
+			args.manis, streams, headers, args.resample_clip, args.resample_factor)
+
 	with tempfile.TemporaryDirectory(prefix="jwe3_acl_db_") as work_dir:
-		bound, database, low, medium = build_database(streams, headers, bind, work_dir,
-																   precision=args.precision)
+		bound, database, low, medium = build_database(
+			streams, headers, bind, work_dir, parents, bind_values,
+			precision=args.precision,
+			medium_proportion=args.medium, low_proportion=args.low)
 
-	# rebuild back to front so offsets stay valid: bulk, then clips, then the database
-	data = data[:found["low_offset"]] + pad_to(low) + pad_to(medium)
+	# Work on the keys region alone and append the bulk once it is settled, so
+	# nothing below can shift the bulk out from under locate_bulk().
+	keys = data[:found["low_offset"]]
+	original_blobs = list_clip_blobs(keys)
+	base = buffer_residue(original_blobs)
+	blocks = block_layout(keys, original_blobs, headers)
 
-	align_to = ref_alignment(data)
-	aligns = blob_alignments(data)
+	# Encode everything first; the file is only touched afterwards.
+	new_blobs = []
 	worst = 0.0
-	for index in range(len(streams) - 1, -1, -1):
-		stream = streams[index]
+	for index, stream in enumerate(streams):
 		if stream.track_type == QVVF:
 			blob = bound[index]
+			if not read_blob_header(blob).get("has_database"):
+				sys.exit(f"clip {index} came back without a database; build_database did not bind it")
 		else:
 			blob = encode_tracks(stream.values, stream.track_type, stream.sample_rate,
 								 wrap=headers[index]["wrap_optimized"])
@@ -203,17 +515,32 @@ def main():
 			finite = np.isfinite(stream.values) & np.isfinite(got)
 			if finite.any():
 				worst = max(worst, float(np.abs(stream.values[finite] - got[finite]).max()))
-		old_size = list_clip_blobs(data)[index][1]
-		rebuilt = read_blob_header(blob)
-		if stream.track_type == QVVF and not rebuilt.get("has_database"):
-			sys.exit(f"clip {index} came back without a database; build_database did not bind it")
-		data = replace_blob(data, index, blob, align_to=align_to, alignment=16)
-		print(f"  stream {index:>3}: {old_size:>7} -> {len(blob):>7} bytes"
+		new_blobs.append(blob)
+		print(f"  stream {index:>3}: {original_blobs[index][1]:>7} -> {len(blob):>7} bytes"
 			  f"{'  database-backed' if stream.track_type == QVVF else '  scalar'}")
 
+	# Splice a whole ManiBlock at a time, back to front so the offsets of the blocks
+	# not yet visited stay valid. Per-blob replacement cannot work here: the padding
+	# after a block's last blob rounds to 8, not 16, and getting that wrong silently
+	# eats the head of the limb structure and crashes the game on spawn at
+	# JWE3.exe+0x1697FBD. See source/formats/manis/limbs.py.
+	cursor = len(new_blobs)
+	with_limbs = 0
+	for block in reversed(blocks):
+		cursor -= len(block["blobs"])
+		keys = rebuild_block(keys, block, base, new_blobs[cursor:cursor + len(block["blobs"])])
+		with_limbs += bool(block["limb"])
+	print(f"  rebuilt {len(blocks)} ManiBlocks, {with_limbs} carrying limb data")
+
 	# the database sits at the tail of buffer 0, immediately after the ManiInfo array
-	db_offset, db_size = find_database(data)
-	data = data[:db_offset] + database + data[db_offset + db_size:]
+	db_offset, db_size = find_database(keys)
+	keys = keys[:db_offset] + database + keys[db_offset + db_size:]
+
+	data = keys + pad_to(low) + pad_to(medium)
+
+	if resampled is not None:
+		data = retime_mani_info(data, args.resample_clip or args.replace_clip,
+								resampled, new_duration)
 
 	with open(args.out, "wb") as fh:
 		fh.write(data)
@@ -245,3 +572,4 @@ def main():
 
 if __name__ == "__main__":
 	sys.exit(main())
+

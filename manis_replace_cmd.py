@@ -20,7 +20,8 @@ import numpy as np
 
 from generated.formats.manis.acl import (
 	decode_file, encode_tracks, decode_blob, _read_samples)
-from source.formats.manis.splice import list_clip_blobs, replace_blob
+from source.formats.manis.limbs import replace_clip_blob
+from source.formats.manis.splice import list_clip_blobs
 from source.formats.manis.database import verify_bulk, read_bulk_info
 
 GATE_A_THRESHOLD = 0.0005
@@ -76,7 +77,9 @@ def main():
 	if err > GATE_A_THRESHOLD:
 		sys.exit("Gate A FAILED - encoder is losing accuracy, stopping")
 
-	out = replace_blob(data, args.clip, blob)
+	# block-aware: the re-encoded blob is a different size, and the padding before a
+	# block's limb structure rounds to 8, not 16 - see source/formats/manis/limbs.py
+	out = replace_clip_blob(data, args.clip, blob)
 	with open(args.out, "wb") as fh:
 		fh.write(out)
 

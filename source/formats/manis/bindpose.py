@@ -81,6 +81,33 @@ def write_jbind(path: str, parents: np.ndarray, values: np.ndarray) -> None:
         fh.write(bind_bytes(parents, values))
 
 
+def extend_bind_pose(parents: np.ndarray, values: np.ndarray, num_tracks: int):
+    """Pad a bind pose out to `num_tracks`, for clips authored on a LARGER rig.
+
+    `target_bone_count` names the skeleton a clip was authored on, and Frontier
+    routinely ships clips built on a different one: 4 of Acrocanthosaurus' 22
+    idle-bundle clips declare 172 bones against its own 170, and Deinosuchus
+    carries 24 built on Dimetrodon's 212. A single bundle therefore needs a bind
+    long enough for its longest clip, or the encoder rejects those clips with
+    "bind pose track count does not match".
+
+    The padded entries address bones this species does not have. The runtime
+    retargets by bone name and drops them, so identity - parentless, no rotation,
+    no translation, unit scale - is the honest filler. It also keeps ACL from
+    stripping a real sub-track against a fabricated default.
+    """
+    count = len(parents)
+    if num_tracks <= count:
+        return parents, values
+    extra = num_tracks - count
+    parents = np.concatenate(
+        (parents, np.full(extra, NO_PARENT, dtype="<u4")))
+    identity = np.zeros((extra, 10), dtype="<f4")
+    identity[:, 3] = 1.0      # rotation w
+    identity[:, 7:10] = 1.0   # unit scale
+    return parents, np.concatenate((values, identity))
+
+
 def bind_for_manis(ms2_path: str, num_tracks: int, model_index: int = 0):
     """Bind pose for a clip with `num_tracks` ACL tracks, or None if it cannot apply.
 
@@ -92,3 +119,61 @@ def bind_for_manis(ms2_path: str, num_tracks: int, model_index: int = 0):
     if len(parents) != num_tracks:
         return None
     return parents, values
+
+
+# component groups inside a qvv sample: rotation xyzw, translation xyz, scale xyz
+SUB_TRACKS = ((0, 4), (4, 7), (7, 10))
+
+
+def clip_defaults(values, bind):
+	"""Per-clip ACL defaults that reproduce a vanilla clip's stripped set exactly.
+
+	ACL strips a sub-track when every sample equals `track_desc::default_value`, and
+	it does NOT store that value - at playback the host supplies it back through
+	`track_writer::get_variable_default_*()`. So the stripped set is a contract with
+	the game, and getting it wrong is invisible in a sample-value comparison: the
+	blob decodes correctly in our tools and renders as a crushed or stretched animal
+	in game, because the game substituted its own number for a component we chose
+	not to store.
+
+	Vanilla is the only description of that contract we have. `values` is the vanilla
+	decode, where a stripped sub-track reads as all-NaN, so:
+
+	- **all-NaN sub-track**: vanilla stripped it, so we must too. The encoder fills
+	  NaN with the default, which makes the sub-track constant-equal-to-default and
+	  ACL strips it. The default's actual value is irrelevant - it never reaches the
+	  file - which is what makes a clip authored on a foreign rig safe to encode
+	  against this species' bind.
+	- **sub-track vanilla stored**: move the default away from the samples so ACL
+	  cannot strip it. This has to cover varying sub-tracks too, not just exactly
+	  constant ones: ACL collapses a NEAR-constant track to a constant first
+	  (constant_rotation_threshold_angle and friends), and would then strip it for
+	  matching the default. A default the samples cannot reach is ignored by a
+	  genuinely varying track, so applying it everywhere costs nothing.
+
+	Returns a (num_tracks, 10) float32 array.
+	"""
+	import numpy as np
+
+	count = values.shape[1]
+	out = np.array(bind[:count], dtype="<f4", copy=True)
+	for lo, hi in SUB_TRACKS:
+		block = values[:, :, lo:hi]
+		missing = np.isnan(block)
+		stripped = missing.all(axis=0).all(axis=-1)
+		kept = ~stripped
+		if not kept.any():
+			continue
+		held = np.nan_to_num(np.nanmax(block, axis=0), nan=0.0)
+		if lo == 0:
+			# quaternions are unit length, so "far away" has to stay on the sphere:
+			# compose a 90 degree turn about X, which no sample can coincide with
+			x, y, z, w = (held[:, i] for i in range(4))
+			root = np.float32(0.70710678)
+			out[kept, 0] = (w * root + x * root)[kept]
+			out[kept, 1] = (y * root + z * root)[kept]
+			out[kept, 2] = (z * root - y * root)[kept]
+			out[kept, 3] = (w * root - x * root)[kept]
+		else:
+			out[kept, lo:hi] = held[kept] + np.float32(1.0)
+	return out

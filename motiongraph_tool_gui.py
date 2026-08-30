@@ -16,10 +16,13 @@ from source.formats.motiongraph.edit import (
 	DEFAULT_GAME,
 	apply_patch_plan,
 	build_patch_plan,
+	load_plan,
 	load_motiongraph,
 	locate_fields,
+	merge_patch_plans,
 	save_plan,
 )
+from source.formats.motiongraph.clone import clone_complete_animation_activity
 from source.formats.motiongraph.report import (
 	build_activity_tree,
 	build_decision_graph,
@@ -27,6 +30,38 @@ from source.formats.motiongraph.report import (
 	build_state_report,
 )
 from source.formats.motiongraph.static_patch import patch_string_slot, repoint_existing_string
+
+
+def describe_motiongraph_field(path: str, kind: str = "") -> str:
+	"""Return a user-facing explanation without overstating unknown semantics."""
+	name = (path or "").lower()
+	if name.endswith("mani") or name == "mani":
+		return "Animation clip: the MANI animation this activity plays."
+	if "speed" in name or "playbackrate" in name:
+		return "Playback speed: 1.0 is normal, 0.5 is half speed, and 2.0 is double speed."
+	if "weight" in name:
+		return "Blend weight: how strongly this activity contributes when animations are combined."
+	if "animationflags" in name or kind == "bitfield":
+		return (
+			"Playback switches such as Looping, Additive, Mirrored, Affects Motion, and "
+			"data-stream suppression. Change named switches rather than the raw number."
+		)
+	if "priorit" in name:
+		return (
+			"Animation priority/routing value. It affects how competing contributions are selected, "
+			"but JWE3's individual numeric/bit meanings are not yet proven. Clone it from a compatible donor."
+		)
+	if "propthrough" in name or "sync" in name:
+		return "Synchronization link used to keep animation phase/progress aligned with another activity or variable."
+	if "datastream" in name:
+		return "Extra curves/events carried with the animation, such as gameplay, bone, or audio-blend data."
+	if kind == "pointer":
+		return "Link to another string, object, or list. The pool/offset is an address, not a gameplay value."
+	if kind == "curve":
+		return "Time-varying curve input rather than one constant value."
+	if kind == "enum":
+		return "Named mode stored as a number. Choose a known name instead of guessing a raw value."
+	return "Fixed-width activity setting. Keep donor values unless its gameplay meaning is understood."
 
 
 def motiongraph_family(source: Path) -> list[Path]:
@@ -74,6 +109,52 @@ def _load_reports(source: Path, name: str | None):
 		ovl, loader, state_text, states, state_stats,
 		decision_text, decision_stats, decision_graph,
 	)
+
+
+def hierarchical_neighborhood_positions(center, visible, edge_pairs,
+										  x_step=245, y_step=105):
+	"""Lay out a directed local neighborhood around one selected graph node.
+
+	The selected node occupies level zero. Following an outgoing edge moves one
+	column right; following an incoming edge moves one column left. Cycles and
+	mixed-direction paths keep the first shortest assignment, which is stable
+	because both nodes and neighbors are traversed in sorted order.
+	"""
+	visible = set(visible)
+	if center not in visible:
+		raise ValueError("The center node must be visible")
+	adjacent = {node: [] for node in visible}
+	for source, target in edge_pairs:
+		if source in visible and target in visible and source != target:
+			adjacent[source].append((target, 1))
+			adjacent[target].append((source, -1))
+	levels, queue = {center: 0}, [center]
+	while queue:
+		node = queue.pop(0)
+		for neighbor, direction in sorted(adjacent[node], key=lambda item: item[0]):
+			if neighbor not in levels:
+				levels[neighbor] = levels[node] + direction
+				queue.append(neighbor)
+	# Defensive fallback for isolated nodes supplied by a caller.
+	for node in sorted(visible - levels.keys()):
+		levels[node] = 0
+	columns = {}
+	for node, level in levels.items():
+		columns.setdefault(level, []).append(node)
+	positions = {}
+	for level, nodes in columns.items():
+		nodes.sort()
+		if center in nodes:
+			positions[center] = (level * x_step, 0)
+			others = [node for node in nodes if node != center]
+			for row, node in enumerate(others):
+				distance = (row // 2 + 1) * y_step
+				positions[node] = (level * x_step, -distance if row % 2 == 0 else distance)
+		else:
+			start_y = -(len(nodes) - 1) * y_step / 2
+			for row, node in enumerate(nodes):
+				positions[node] = (level * x_step, start_y + row * y_step)
+	return positions
 
 
 class GraphNode(QtWidgets.QGraphicsRectItem):
@@ -252,10 +333,13 @@ class MainWindow(window.MainWindow):
 		self.field_rows = []
 		self.plan = None
 		self.activity_address_filter = None
+		self.activity_tree_state = None
+		self.clone_redirect_source = None
 
 		root = QtWidgets.QVBoxLayout(self.body)
 		banner = QtWidgets.QLabel(
-			"SAFE MODE: fixed topology and fixed-width edits only. The source OVL is never overwritten."
+			"SAFE MODE: staged output only. Topology growth is limited to the game-verified complete-activity clone. "
+			"The source OVL is never overwritten."
 		)
 		banner.setWordWrap(True)
 		banner.setStyleSheet("color: #ffe075; font-weight: bold; padding: 5px;")
@@ -290,6 +374,7 @@ class MainWindow(window.MainWindow):
 		self._build_states_tab()
 		self._build_decisions_tab()
 		self._build_fields_tab()
+		self._build_clone_tab()
 		self._build_retarget_tab()
 		self._build_stage_tab()
 
@@ -316,9 +401,18 @@ class MainWindow(window.MainWindow):
 		fit_button = QtWidgets.QPushButton("Fit graph")
 		fit_button.clicked.connect(self.fit_graph)
 		self.graph_hops = QtWidgets.QSpinBox()
-		self.graph_hops.setRange(1, 2)
+		self.graph_hops.setRange(1, 4)
 		self.graph_hops.setValue(1)
 		self.graph_hops.setPrefix("Hops: ")
+		self.graph_hops.valueChanged.connect(self.refocus_state_graph)
+		self.graph_layout_mode = QtWidgets.QComboBox()
+		self.graph_layout_mode.addItem("Hierarchical focus", "hierarchical")
+		self.graph_layout_mode.addItem("Original grid", "grid")
+		self.graph_layout_mode.setToolTip(
+			"Hierarchical focus puts incoming states left, the selected state in the middle, "
+			"and outgoing states right. Show All remains a compact overview grid."
+		)
+		self.graph_layout_mode.currentIndexChanged.connect(self.relayout_state_graph)
 		focus_button = QtWidgets.QPushButton("Focus selected")
 		focus_button.clicked.connect(self.focus_selected_state)
 		all_button = QtWidgets.QPushButton("Show all")
@@ -332,6 +426,7 @@ class MainWindow(window.MainWindow):
 		controls.addWidget(find_button)
 		controls.addWidget(fit_button)
 		controls.addWidget(self.graph_hops)
+		controls.addWidget(self.graph_layout_mode)
 		controls.addWidget(focus_button)
 		controls.addWidget(all_button)
 		controls.addWidget(self.edges_toggle)
@@ -341,7 +436,8 @@ class MainWindow(window.MainWindow):
 		self.graph_breadcrumb.setStyleSheet("color: #8ab4f8; padding-left: 3px;")
 		layout.addWidget(self.graph_breadcrumb)
 		explanation = QtWidgets.QLabel(
-			"≈ labels are inferred from reachable clips or streams; Frontier states are anonymous runtime containers."
+			"≈ labels are inferred from reachable clips or streams; Frontier states are anonymous runtime containers. "
+			"In Hierarchical focus mode, select any state to isolate and lay out its neighborhood."
 		)
 		explanation.setStyleSheet("color: #9aa0a6; padding: 0 2px 4px 2px;")
 		layout.addWidget(explanation)
@@ -352,6 +448,8 @@ class MainWindow(window.MainWindow):
 		self.graph_nodes = {}
 		self.graph_edges = []
 		self.graph_edge_records = []
+		self.graph_grid_positions = {}
+		self.graph_focus_state = None
 		self.graph_match_index = -1
 		self.tabs.addTab(page, "Graph")
 
@@ -423,6 +521,11 @@ class MainWindow(window.MainWindow):
 			"Open Fields / Edit and scan for byte-verified properties of the selected activity"
 		)
 		self.inspect_activity_button.clicked.connect(self.inspect_activity_fields)
+		self.clone_activity_button = QtWidgets.QPushButton("Clone selected complete activity")
+		self.clone_activity_button.setToolTip(
+			"Open the Clone Activity tab with this exact activity instance selected"
+		)
+		self.clone_activity_button.clicked.connect(self.select_activity_for_clone)
 		self.activity_tree = QtWidgets.QTreeWidget()
 		self.activity_tree.setHeaderLabels(["Relationship", "Activity type", "Label / clips"])
 		self.activity_tree.setAlternatingRowColors(True)
@@ -436,6 +539,7 @@ class MainWindow(window.MainWindow):
 		right_layout.addWidget(self.state_details, 2)
 		right_layout.addWidget(self.activity_search)
 		right_layout.addWidget(self.inspect_activity_button)
+		right_layout.addWidget(self.clone_activity_button)
 		right_layout.addWidget(self.activity_tree, 5)
 		split = QtWidgets.QSplitter()
 		split.addWidget(self.state_table)
@@ -460,6 +564,26 @@ class MainWindow(window.MainWindow):
 	def _build_fields_tab(self):
 		self.fields_page = QtWidgets.QWidget()
 		layout = QtWidgets.QVBoxLayout(self.fields_page)
+		guide = QtWidgets.QGroupBox("Activity settings — plain-language guide")
+		guide_layout = QtWidgets.QVBoxLayout(guide)
+		guide_text = QtWidgets.QLabel(
+			"<b>Clip</b> chooses the animation; <b>Speed</b> changes playback rate; "
+			"<b>Weight</b> controls blend strength; <b>Flags</b> are named playback switches; "
+			"<b>Priority</b> affects competing animation contributions; and "
+			"<b>Pointers</b> are links to strings, objects, or lists—not values to guess. "
+			"Hover a field row for its specific explanation."
+		)
+		guide_text.setWordWrap(True)
+		guide_layout.addWidget(guide_text)
+		safety = QtWidgets.QLabel(
+			"Safe authoring rule: clone the <b>complete activity settings</b> from a compatible donor. "
+			"Changing only the clip keeps the old donor's flags, layer/priority behavior, sync links, "
+			"and data streams, which can produce partial-body or T-like results."
+		)
+		safety.setWordWrap(True)
+		safety.setStyleSheet("color: #ffe075; padding-top: 3px;")
+		guide_layout.addWidget(safety)
+		layout.addWidget(guide)
 		scope_row = QtWidgets.QHBoxLayout()
 		self.field_scope = QtWidgets.QComboBox()
 		self.field_scope.addItem("Entire motiongraph", "all")
@@ -492,27 +616,125 @@ class MainWindow(window.MainWindow):
 		self.field_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
 		self.field_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
 		self.field_table.horizontalHeader().setStretchLastSection(True)
+		self.show_field_addresses = QtWidgets.QCheckBox("Advanced: show pool/offset addresses")
+		self.show_field_addresses.setToolTip(
+			"Pool and offset identify where bytes are stored; they are not animation settings."
+		)
+		self.show_field_addresses.toggled.connect(
+			lambda checked: (
+				self.field_table.setColumnHidden(5, not checked),
+				self.field_table.setColumnHidden(6, not checked),
+			)
+		)
+		self.field_table.setColumnHidden(5, True)
+		self.field_table.setColumnHidden(6, True)
+		layout.addWidget(self.show_field_addresses)
 		edit_row = QtWidgets.QHBoxLayout()
 		self.edit_mode = QtWidgets.QComboBox()
 		self.edit_mode.addItems(["Numeric value", "Enum name", "Flag operations"])
 		self.value_edit = QtWidgets.QLineEdit()
 		self.value_edit.setPlaceholderText("Replacement: e.g. 0.25, enum name, or FlagA=1,FlagB=0")
-		self.plan_button = QtWidgets.QPushButton("Create / save patch plan…")
+		self.plan_button = QtWidgets.QPushButton("Add selected edit to queue")
 		self.plan_button.clicked.connect(self.create_plan)
 		edit_row.addWidget(QtWidgets.QLabel("Replacement"))
 		edit_row.addWidget(self.edit_mode)
 		edit_row.addWidget(self.value_edit, 1)
 		edit_row.addWidget(self.plan_button)
 		layout.addLayout(edit_row)
+		queue_controls = QtWidgets.QHBoxLayout()
+		self.queue_label = QtWidgets.QLabel("Patch queue: empty")
+		self.queue_label.setStyleSheet("color: #8ab4f8;")
+		self.save_queue_button = QtWidgets.QPushButton("Save queue...")
+		self.save_queue_button.clicked.connect(self.save_queue)
+		self.load_queue_button = QtWidgets.QPushButton("Load queue...")
+		self.load_queue_button.clicked.connect(self.load_queue)
+		self.clear_queue_button = QtWidgets.QPushButton("Clear queue")
+		self.clear_queue_button.clicked.connect(self.clear_queue)
+		queue_controls.addWidget(self.queue_label, 1)
+		queue_controls.addWidget(self.save_queue_button)
+		queue_controls.addWidget(self.load_queue_button)
+		queue_controls.addWidget(self.clear_queue_button)
+		layout.addLayout(queue_controls)
+		self.queue_table = QtWidgets.QTableWidget(0, 4)
+		self.queue_table.setHorizontalHeaderLabels(["Field", "Kind", "Replacement", "Addresses"])
+		self.queue_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+		self.queue_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+		self.queue_table.horizontalHeader().setStretchLastSection(True)
+		self.queue_table.setMaximumHeight(130)
+		layout.addWidget(self.queue_table)
 		layout.addWidget(self.field_table, 1)
+		self.refresh_patch_queue()
 		self.tabs.addTab(self.fields_page, "Fields / Edit")
+
+	def _build_clone_tab(self):
+		self.clone_page = QtWidgets.QWidget()
+		layout = QtWidgets.QVBoxLayout(self.clone_page)
+		info = QtWidgets.QLabel(
+			"Clone one exact <b>AnimationActivity</b> together with its full settings and pointer layout, "
+			"then redirect that instance's current inbound references to the clone. This is the complete "
+			"activity/payload operation verified in game by Test L."
+		)
+		info.setWordWrap(True)
+		layout.addWidget(info)
+		limits = QtWidgets.QLabel(
+			"This does <b>not</b> duplicate a MANI, create a new clip name, add another state entry, or add "
+			"random selection. It creates an independent copy of the selected activity on its existing edges."
+		)
+		limits.setWordWrap(True)
+		limits.setStyleSheet("color: #ffe075; padding: 4px 0;")
+		layout.addWidget(limits)
+		form = QtWidgets.QFormLayout()
+		self.clone_selection_label = QtWidgets.QLabel(
+			"No activity selected — choose one in States and click Clone selected complete activity"
+		)
+		self.clone_selection_label.setWordWrap(True)
+		form.addRow("Exact donor", self.clone_selection_label)
+		self.clone_usage_label = QtWidgets.QLabel("Not selected")
+		self.clone_usage_label.setWordWrap(True)
+		form.addRow("Used by states", self.clone_usage_label)
+		self.clone_redirect_scope = QtWidgets.QComboBox()
+		self.clone_redirect_scope.addItem("Only selected state occurrence", "occurrence")
+		self.clone_redirect_scope.addItem(
+			"Every inbound reference to this shared activity", "all"
+		)
+		self.clone_redirect_scope.setToolTip(
+			"Occurrence redirects only the exact activity pointer clicked in the state tree. "
+			"All redirects every pointer that currently reaches the shared donor."
+		)
+		form.addRow("Redirect scope", self.clone_redirect_scope)
+		self.clone_speed_override = QtWidgets.QCheckBox("Override playback speed on the clone")
+		self.clone_speed_override.setChecked(False)
+		form.addRow("Optional edit", self.clone_speed_override)
+		self.clone_speed = QtWidgets.QDoubleSpinBox()
+		self.clone_speed.setDecimals(4)
+		self.clone_speed.setRange(0.0, 1000.0)
+		self.clone_speed.setSingleStep(0.25)
+		self.clone_speed.setValue(1.0)
+		self.clone_speed.setEnabled(False)
+		self.clone_speed_override.toggled.connect(self.clone_speed.setEnabled)
+		form.addRow("Clone speed", self.clone_speed)
+		layout.addLayout(form)
+		apply_button = QtWidgets.QPushButton("Clone complete activity into staged family")
+		apply_button.clicked.connect(self.apply_complete_activity_clone)
+		layout.addWidget(apply_button)
+		workflow = QtWidgets.QLabel(
+			"Workflow: load the untouched source OVL → select an activity in States → copy the full family "
+			"in Stage / Apply → run this once. The staged OVL is reloaded and verified automatically."
+		)
+		workflow.setWordWrap(True)
+		workflow.setStyleSheet("color: #9aa0a6;")
+		layout.addWidget(workflow)
+		layout.addStretch(1)
+		self.tabs.addTab(self.clone_page, "Clone Activity")
 
 	def _build_retarget_tab(self):
 		page = QtWidgets.QWidget()
 		form = QtWidgets.QFormLayout(page)
 		info = QtWidgets.QLabel(
 			"Clip retarget repoints existing references to another existing same-pool string. "
-			"String-slot replacement fits a new shorter/equal ASCII name into one existing allocation."
+			"String-slot replacement fits a new shorter/equal ASCII name into one existing allocation. "
+			"Important: clip retargeting does not copy flags, priority/layer behavior, sync links, or data "
+			"streams. Use it only between behaviorally compatible clips; complete activity cloning is safer."
 		)
 		info.setWordWrap(True)
 		form.addRow(info)
@@ -557,13 +779,12 @@ class MainWindow(window.MainWindow):
 		self.stage_files = QtWidgets.QPlainTextEdit()
 		self.stage_files.setReadOnly(True)
 		layout.addWidget(self.stage_files, 1)
-		self.apply_plan_button = QtWidgets.QPushButton("Apply current patch plan to staged family")
+		self.apply_plan_button = QtWidgets.QPushButton("Apply queued patch plan to staged family")
 		self.apply_plan_button.clicked.connect(self.apply_plan)
 		layout.addWidget(self.apply_plan_button)
 		warning = QtWidgets.QLabel(
-			"This editor does not install into the live game. Each Apply rebuilds the staged main OVL "
-			"from the source, replacing an earlier staged edit. Use separate stage directories (or an "
-			"alternating source/stage pipeline) for sequential operations."
+			"This editor does not install into the live game. Queue every desired value first, then Apply "
+			"once: the staged main OVL is rebuilt from the source with the complete queue atomically."
 		)
 		warning.setWordWrap(True)
 		layout.addWidget(warning)
@@ -609,6 +830,10 @@ class MainWindow(window.MainWindow):
 		worker.signals.finished.connect(lambda: self.load_button.setEnabled(True))
 
 	def loaded_source(self, result):
+		if self.plan:
+			self.plan = None
+			self.refresh_patch_queue()
+			logging.info("Cleared patch queue because a new source motiongraph was loaded")
 		(self.ovl, self.loader, _state_text, self.state_rows, state_stats,
 		 decision_text, decision_stats, self.decision_graph_data) = result
 		self.name_edit.setText(self.loader.name)
@@ -640,10 +865,13 @@ class MainWindow(window.MainWindow):
 		self.graph_nodes = {}
 		self.graph_edges = []
 		self.graph_edge_records = []
+		self.graph_grid_positions = {}
+		self.graph_focus_state = None
 		valid = [state for state in self.state_rows if state]
 		columns, x_step, y_step = 12, 225, 105
 		for order, state in enumerate(valid):
 			position = ((order % columns) * x_step, (order // columns) * y_step)
+			self.graph_grid_positions[state["index"]] = position
 			node = GraphNode(state, position, self.focus_state_neighborhood)
 			self.graph_scene.addItem(node)
 			self.graph_nodes[state["index"]] = node
@@ -690,6 +918,64 @@ class MainWindow(window.MainWindow):
 			self.graph_scene.itemsBoundingRect().adjusted(-40, -40, 40, 40)
 		)
 		self.fit_graph()
+
+	@staticmethod
+	def position_graph_edge(source_node, target_node, line_item, arrow, trim=92.0):
+		"""Reposition one straight directed edge after a graph layout change."""
+		start = source_node.sceneBoundingRect().center()
+		end = target_node.sceneBoundingRect().center()
+		line = QtCore.QLineF(start, end)
+		if not line.length():
+			line_item.setLine(line)
+			arrow.setPolygon(QtGui.QPolygonF())
+			return
+		cut = min(trim, line.length() * 0.35)
+		unit_x, unit_y = line.dx() / line.length(), line.dy() / line.length()
+		end = QtCore.QPointF(end.x() - unit_x * cut, end.y() - unit_y * cut)
+		line.setP2(end)
+		line_item.setLine(line)
+		angle = math.atan2(line.dy(), line.dx())
+		left = end - QtCore.QPointF(
+			math.cos(angle - 0.5) * 9, math.sin(angle - 0.5) * 9
+		)
+		right = end - QtCore.QPointF(
+			math.cos(angle + 0.5) * 9, math.sin(angle + 0.5) * 9
+		)
+		arrow.setPolygon(QtGui.QPolygonF([end, left, right]))
+
+	def update_state_graph_edges(self):
+		for source, target, line, arrow in self.graph_edge_records:
+			self.position_graph_edge(
+				self.graph_nodes[source], self.graph_nodes[target], line, arrow
+			)
+
+	def apply_state_graph_layout(self):
+		mode = self.graph_layout_mode.currentData()
+		if mode == "hierarchical" and self.graph_focus_state is not None:
+			visible = {
+				index for index, item in self.graph_nodes.items() if item.isVisible()
+			}
+			positions = hierarchical_neighborhood_positions(
+				self.graph_focus_state,
+				visible,
+				[(source, target) for source, target, *_ in self.graph_edge_records],
+			)
+		else:
+			positions = self.graph_grid_positions
+		for index, position in positions.items():
+			self.graph_nodes[index].setPos(*position)
+		self.update_state_graph_edges()
+
+	def relayout_state_graph(self, *_args):
+		if not self.graph_nodes:
+			return
+		self.apply_state_graph_layout()
+		self.graph_view.set_content_rect(self.visible_node_bounds(self.graph_nodes.values()))
+		self.fit_graph()
+
+	def refocus_state_graph(self, *_args):
+		if self.graph_focus_state in self.graph_nodes:
+			self.focus_state_neighborhood(self.graph_focus_state)
 
 	def populate_decision_graph(self):
 		self.decision_graph_scene.clear()
@@ -870,6 +1156,8 @@ class MainWindow(window.MainWindow):
 			line.setVisible(shown)
 			arrow.setVisible(shown)
 		center = self.graph_nodes[state_index]
+		self.graph_focus_state = state_index
+		self.apply_state_graph_layout()
 		self.graph_scene.clearSelection()
 		center.setSelected(True)
 		self.graph_breadcrumb.setText(
@@ -880,12 +1168,15 @@ class MainWindow(window.MainWindow):
 		self.fit_graph()
 
 	def show_all_state_graph(self):
+		self.graph_focus_state = None
+		self.graph_scene.clearSelection()
 		for item in self.graph_nodes.values():
 			item.setVisible(True)
 		for _, _, line, arrow in self.graph_edge_records:
 			line.setVisible(self.edges_toggle.isChecked())
 			arrow.setVisible(self.edges_toggle.isChecked())
 		self.graph_breadcrumb.setText("All states")
+		self.apply_state_graph_layout()
 		self.graph_view.set_content_rect(self.visible_node_bounds(self.graph_nodes.values()))
 		self.fit_graph()
 
@@ -919,6 +1210,9 @@ class MainWindow(window.MainWindow):
 			if int(self.state_table.item(row, 0).text()) == state_index:
 				self.state_table.selectRow(row)
 				break
+		if (self.graph_layout_mode.currentData() == "hierarchical"
+				and self.graph_focus_state != state_index):
+			self.focus_state_neighborhood(state_index)
 
 	def show_state_details(self):
 		self.update_field_scope_label()
@@ -956,6 +1250,7 @@ class MainWindow(window.MainWindow):
 	def populate_activity_tree(self, state_index):
 		self.activity_tree.clear()
 		self.activity_node_items = {}
+		self.activity_tree_state = state_index
 		if self.loader is None:
 			return
 		try:
@@ -978,6 +1273,7 @@ class MainWindow(window.MainWindow):
 			item.setData(2, QtCore.Qt.UserRole, node.get("label"))
 			item.setData(2, QtCore.Qt.UserRole + 1, node.get("activity_type"))
 			item.setData(2, QtCore.Qt.UserRole + 2, node.get("address"))
+			item.setData(2, QtCore.Qt.UserRole + 3, node.get("inbound_source"))
 			if node_number is not None:
 				self.activity_node_items[node_number] = item
 			if node.get("shared"):
@@ -997,36 +1293,90 @@ class MainWindow(window.MainWindow):
 		)
 
 	def inspect_activity_fields(self):
+		resolved = self.selected_activity()
+		if resolved is None:
+			return
+		_activity_type = resolved["activity_type"]
+		label = resolved["label"]
+		address = resolved["address"]
+		self.activity_address_filter = address
+		self.field_scope.setCurrentIndex(self.field_scope.findData("activity"))
+		self.activity_filter.setText(label)
+		self.type_filter.setText(_activity_type)
+		self.field_filter.clear()
+		self.tabs.setCurrentWidget(self.fields_page)
+		message = (
+			f"Scanning exact {_activity_type} {label!r} at "
+			f"pool {address[0]} offset {address[1]}"
+		)
+		self.status_bar.showMessage(message, 8000)
+		logging.info(message)
+		self.scan_fields()
+
+	def selected_activity(self):
+		"""Resolve the selected tree row to one exact editable Activity address."""
 		item = self.activity_tree.currentItem()
 		if item is None:
 			self.showerror("Select an activity-tree node first")
-			return
-		# Resolve a displayed shared-reference row to the concrete activity row.
+			return None
+		# Preserve the clicked edge before resolving a shared-reference display row
+		# to the concrete activity. This identifies one exact state occurrence.
+		inbound_source = item.data(2, QtCore.Qt.UserRole + 3)
+		relationship = item.text(0)
 		target = item.data(1, QtCore.Qt.UserRole)
 		if target is not None:
 			item = self.activity_node_items.get(target, item)
 		activity_type = item.data(2, QtCore.Qt.UserRole + 1)
 		if not activity_type or activity_type in ("shared reference", "limit"):
 			self.showerror("The selected row is not an editable activity")
-			return
+			return None
 		label = item.data(2, QtCore.Qt.UserRole) or ""
 		address = item.data(2, QtCore.Qt.UserRole + 2)
 		if not address or len(address) != 2:
 			self.showerror("Could not resolve the selected activity's exact STATIC address")
+			return None
+		if inbound_source and len(inbound_source) == 2:
+			inbound_source = tuple(int(value) for value in inbound_source)
+		else:
+			inbound_source = None
+		return {
+			"activity_type": activity_type,
+			"label": label,
+			"address": tuple(int(value) for value in address),
+			"inbound_source": inbound_source,
+			"relationship": relationship,
+			"state": self.activity_tree_state,
+		}
+
+	def select_activity_for_clone(self):
+		resolved = self.selected_activity()
+		if resolved is None:
 			return
-		self.activity_address_filter = tuple(int(value) for value in address)
-		self.field_scope.setCurrentIndex(self.field_scope.findData("activity"))
-		self.activity_filter.setText(label)
-		self.type_filter.setText(activity_type)
-		self.field_filter.clear()
-		self.tabs.setCurrentWidget(self.fields_page)
-		message = (
-			f"Scanning exact {activity_type} {label!r} at "
-			f"pool {address[0]} offset {address[1]}"
+		activity_type = resolved["activity_type"]
+		label = resolved["label"]
+		address = resolved["address"]
+		if activity_type != "AnimationActivity":
+			self.showerror(
+				f"Complete cloning currently supports AnimationActivity only, not {activity_type}"
+			)
+			return
+		self.activity_address_filter = address
+		self.clone_redirect_source = resolved["inbound_source"]
+		usage = [
+			row["index"] for row in self.state_rows
+			if address in row.get("activity_addresses", ())
+		]
+		self.clone_selection_label.setText(
+			f"{label or '(unnamed)'} — {activity_type} "
+			f"(pool {address[0]}, offset {address[1]})"
 		)
-		self.status_bar.showMessage(message, 8000)
-		logging.info(message)
-		self.scan_fields()
+		self.clone_usage_label.setText(", ".join(str(index) for index in usage) or "None")
+		preferred_scope = "occurrence" if self.clone_redirect_source else "all"
+		self.clone_redirect_scope.setCurrentIndex(
+			self.clone_redirect_scope.findData(preferred_scope)
+		)
+		self.tabs.setCurrentWidget(self.clone_page)
+		self.status_bar.showMessage("Exact activity selected for complete cloning", 6000)
 
 	def selected_state_indices(self):
 		return sorted({
@@ -1160,14 +1510,91 @@ class MainWindow(window.MainWindow):
 				value = field.get("curve_value", field["value"])
 				values = [owner["activity"], owner["activity_type"], field["path"], field["kind"],
 				          value, field["pool"], field["offset"], field["verified"]]
+				explanation = describe_motiongraph_field(field["path"], field["kind"])
 				for column, item in enumerate(values):
-					self.field_table.setItem(row, column, QtWidgets.QTableWidgetItem(str(item)))
+					cell = QtWidgets.QTableWidgetItem(str(item))
+					cell.setToolTip(explanation)
+					self.field_table.setItem(row, column, cell)
 		self.field_table.resizeColumnsToContents()
 		message = f"Found {len(self.field_rows)} fields"
 		if mismatches:
 			message += f"; skipped {len(mismatches)} stride-mismatched layouts"
 		self.status_bar.showMessage(message, 8000)
 		logging.info(message)
+
+	@staticmethod
+	def operation_replacement(operation):
+		if operation.get("flags") is not None:
+			return ", ".join(operation["flags"])
+		if operation.get("enum") is not None:
+			return str(operation["enum"])
+		return str(operation.get("value"))
+
+	def refresh_patch_queue(self):
+		operations = (self.plan or {}).get("operations") or []
+		edits = (self.plan or {}).get("edits") or []
+		self.queue_table.setRowCount(0)
+		for operation in operations:
+			row = self.queue_table.rowCount()
+			self.queue_table.insertRow(row)
+			values = [
+				operation.get("field"), operation.get("kind"),
+				self.operation_replacement(operation), operation.get("edit_count", "?"),
+			]
+			for column, value in enumerate(values):
+				self.queue_table.setItem(row, column, QtWidgets.QTableWidgetItem(str(value)))
+		self.queue_table.resizeColumnsToContents()
+		if edits:
+			self.queue_label.setText(
+				f"Patch queue: {len(operations)} operations / {len(edits)} unique addresses"
+			)
+		else:
+			self.queue_label.setText("Patch queue: empty")
+		enabled = bool(edits)
+		self.save_queue_button.setEnabled(enabled)
+		self.clear_queue_button.setEnabled(enabled)
+
+	def save_queue(self):
+		if not self.plan:
+			self.showerror("Add at least one edit to the patch queue first")
+			return
+		path, _ = QtWidgets.QFileDialog.getSaveFileName(
+			self, "Save patch queue", "motiongraph_patch.json", "JSON files (*.json)"
+		)
+		if not path:
+			return
+		try:
+			save_plan(Path(path), self.plan)
+			self.status_bar.showMessage(f"Saved patch queue to {path}", 8000)
+			logging.info(f"Saved motiongraph patch queue: {path}")
+		except Exception as exc:
+			self.showerror(str(exc))
+
+	def load_queue(self):
+		path, _ = QtWidgets.QFileDialog.getOpenFileName(
+			self, "Load patch queue", "", "JSON files (*.json)"
+		)
+		if not path:
+			return
+		if self.plan and QtWidgets.QMessageBox.question(
+			self, "Replace patch queue", "Replace the current queued edits?",
+		) != QtWidgets.QMessageBox.Yes:
+			return
+		try:
+			self.plan = load_plan(Path(path))
+			self.refresh_patch_queue()
+			self.status_bar.showMessage(
+				f"Loaded {len(self.plan['edits'])} queued addresses from {path}", 8000
+			)
+			logging.info(f"Loaded motiongraph patch queue: {path}")
+		except Exception as exc:
+			self.showerror(str(exc))
+
+	def clear_queue(self):
+		self.plan = None
+		self.refresh_patch_queue()
+		self.status_bar.showMessage("Cleared patch queue", 5000)
+		logging.info("Cleared motiongraph patch queue")
 
 	def create_plan(self):
 		selected = sorted({index.row() for index in self.field_table.selectionModel().selectedRows()})
@@ -1191,17 +1618,20 @@ class MainWindow(window.MainWindow):
 				kwargs["enum_name"] = text
 			else:
 				kwargs["flag_ops"] = [item.strip() for item in text.split(",") if item.strip()]
-			self.plan = build_patch_plan(
+			addition = build_patch_plan(
 				grouped, self.source_path(), self.name_edit.text().strip(), field_paths.pop(), **kwargs
 			)
-			path, _ = QtWidgets.QFileDialog.getSaveFileName(
-				self, "Save patch plan", "motiongraph_patch.json", "JSON files (*.json)"
+			before = len((self.plan or {}).get("edits") or [])
+			self.plan = merge_patch_plans([self.plan, addition] if self.plan else [addition])
+			added = len(self.plan["edits"]) - before
+			self.refresh_patch_queue()
+			self.status_bar.showMessage(
+				f"Queued {added} new addresses; {len(self.plan['edits'])} total", 8000
 			)
-			if not path:
-				return
-			save_plan(Path(path), self.plan)
-			self.status_bar.showMessage(f"Saved {len(self.plan['edits'])} verified edits to {path}", 8000)
-			logging.info(f"Saved {len(self.plan['edits'])} verified edits to patch plan: {path}")
+			logging.info(
+				f"Queued motiongraph operation for {len(addition['edits'])} addresses; "
+				f"{len(self.plan['edits'])} unique addresses total"
+			)
 		except Exception as exc:
 			self.showerror(str(exc))
 
@@ -1216,7 +1646,7 @@ class MainWindow(window.MainWindow):
 
 	def apply_plan(self):
 		if not self.plan:
-			self.showerror("Create a patch plan first")
+			self.showerror("Add at least one edit to the patch queue first")
 			return
 		try:
 			report = apply_patch_plan(self.source_path(), self.output_path(), self.plan, DEFAULT_GAME)
@@ -1226,6 +1656,43 @@ class MainWindow(window.MainWindow):
 			logging.info(
 				f"Applied and reloaded staged patch: {report.edits} edits, "
 				f"{report.changed_bytes} changed bytes"
+			)
+		except Exception as exc:
+			self.showerror(str(exc))
+
+	def apply_complete_activity_clone(self):
+		if not self.activity_address_filter:
+			self.showerror(
+				"Select an AnimationActivity in the States tab and click "
+				"Clone selected complete activity first"
+			)
+			return
+		try:
+			pool, offset = self.activity_address_filter
+			speed = self.clone_speed.value() if self.clone_speed_override.isChecked() else None
+			redirect_sources = None
+			if self.clone_redirect_scope.currentData() == "occurrence":
+				if self.clone_redirect_source is None:
+					raise ValueError(
+						"The selected tree row has no exact inbound source; choose All inbound "
+						"references or select the activity through a state occurrence"
+					)
+				redirect_sources = (self.clone_redirect_source,)
+			report = clone_complete_animation_activity(
+				self.source_path(), self.output_path(), pool, offset,
+				name=self.name_edit.text().strip() or None,
+				speed=speed, redirect_sources=redirect_sources, game=DEFAULT_GAME,
+			)
+			self.status_bar.showMessage(
+				f"Cloned complete activity and redirected {report.inbound_references} references; "
+				"staged archive reloaded successfully",
+				12000,
+			)
+			logging.info(
+				f"Complete activity clone verified: donor={report.donor_wrapper}, "
+				f"clone={report.clone_wrapper}, data={report.clone_data}, "
+				f"inbound={report.inbound_references}, fragments=+{report.cloned_fragments}, "
+				f"sentinels={report.moved_end_sentinels}, speed={report.speed}"
 			)
 		except Exception as exc:
 			self.showerror(str(exc))

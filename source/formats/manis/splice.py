@@ -114,6 +114,13 @@ def replace_blob(data: bytes, index: int, new_blob: bytes, align_to: int = None,
 				 alignment: int = 16) -> bytes:
 	"""Swap the blob at `index` for `new_blob`, copying everything else verbatim.
 
+	**Only safe when `new_blob` is the same size as the one it replaces.** For a
+	size change use `limbs.replace_clip_blob`: this pads to 16 after every blob,
+	but the padding after a ManiBlock's LAST blob rounds to 8, so this eats up to
+	8 bytes off the head of the limb structure. Those bytes are a zeroed load
+	pointer, so nothing here complains, the structure silently shifts, and the game
+	dies on spawn at `JWE3.exe+0x1697FBD`.
+
 	Replaces the blob *and the padding that follows it*, writing however much new
 	padding the parser will expect. `align_to` is the offset class the padded end must
 	land on, from `ref_alignment`; without it the blob is swapped one-for-one and the

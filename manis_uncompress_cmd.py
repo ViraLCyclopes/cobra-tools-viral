@@ -59,9 +59,63 @@ def pad_to(size, alignment):
 	return (-size) % alignment
 
 
+# A qvv row with nothing applied: identity rotation, no translation, unit scale.
+IDENTITY_QVV = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+
+
+def extend_bind(bind, tracks):
+	"""Grow a bind pose to cover clips authored on a LARGER skeleton.
+
+	`target_bone_count` names the rig a clip was authored on, and it is routinely
+	not the species' own: 4 of Acrocanthosaurus' 22 idle-bundle clips declare 172
+	bones against its 170-bone rig, and Deinosuchus ships 24 clips built on
+	Dimetrodon's 212-bone skeleton. Those extra tracks address bones this species
+	does not have, so there is no bind value to substitute - and the engine drops
+	them at runtime anyway, because it retargets by bone name.
+
+	Identity is the honest filler: it applies nothing. Clamping the index instead
+	would silently graft one bone's rest pose onto another.
+	"""
+	if tracks <= bind.shape[0]:
+		return bind
+	padding = np.tile(np.array(IDENTITY_QVV, dtype=bind.dtype),
+					  (tracks - bind.shape[0], 1))
+	return np.concatenate((bind, padding[:, :bind.shape[1]]))
+
+
+def close_wrap(values, frame_count, what=""):
+	"""Restore the final frame of a wrap-optimised clip.
+
+	A looping clip stores `frame_count - 1` samples because its last frame is
+	identical to its first; ACL records this in the blob header as
+	`wrap_optimized` and the runtime reinstates the frame. **dtype 0 has no such
+	flag.** Writing the short sample array under a header that still declares
+	`frame_count` hands the engine one frame less animation than it schedules
+	against, so the clip ends early and its state can leave by an exit it would
+	never normally reach - an Acrocanthosaurus charging after a preen, as seen in
+	Test AG where the ONLY change was this conversion.
+
+	11 of the 22 clips in Acro's idle bundle are wrap-optimised, `standpreen` and
+	`standidle01` among them, so this is the common case rather than an edge one.
+	"""
+	if values is None or frame_count is None:
+		return values
+	have = values.shape[0]
+	if have == frame_count:
+		return values
+	if have == frame_count - 1:
+		return np.concatenate((values, values[:1]))
+	# Any other mismatch is not a wrap and must not be papered over.
+	logging.warning(
+		f"{what or 'clip'} has {have} samples for {frame_count} frames; "
+		"not a wrap-optimised off-by-one, leaving as is")
+	return values
+
+
 def fill_defaults(values, bind):
 	"""Substitute the bind pose wherever the decoder marked a stripped sub-track."""
 	out = values.copy()
+	bind = extend_bind(bind, out.shape[1])
 	for track in range(out.shape[1]):
 		for low, high in ((0, 4), (4, 7), (7, 10)):
 			mask = np.isnan(out[:, track, low:high])
@@ -228,6 +282,9 @@ def main():
 					help="experimental control: omit scale tables using shipped no-scale conventions")
 	ap.add_argument("--omit-shear", action="store_true",
 					help="JWE3 experiment: retain SclBones but omit the DLA/PZ ShrBones block")
+	ap.add_argument("--keep-stream", action="store_true",
+					help="Keep the external stream name so the keys buffer stays in its "
+						 "Anim_L* stream instead of becoming resident in STATIC")
 	ap.add_argument("--overlay",
 					help="Blender-exported dtype-0 MANIS whose named clips replace source samples")
 	ap.add_argument("--overlay-clip", action="append", default=[],
@@ -288,9 +345,19 @@ def main():
 	print(f"{os.path.basename(args.manis)}: {count} clips, "
 		  f"{len(transforms)} transform streams")
 
-	# preamble, as ManisLoader.extract writes it, with an empty external stream name
+	# Preamble, as ManisLoader.extract writes it. The stream name decides where
+	# MANI._buffer_layout puts the keys buffer: an empty name makes everything
+	# resident in STATIC, while keeping it leaves the clips in their Anim_L*
+	# stream the way vanilla ships them. Dropping it also strands the stream's
+	# old ACL bulk, which nothing then updates - a suspect for the spurious
+	# state exits seen after a conversion (Test AG).
 	preamble = struct.pack("<HHI", manis.version, manis.context.mani_version, count)
-	preamble += b"\x00"
+	stream_name = str(manis.stream or "")
+	if args.keep_stream and stream_name:
+		preamble += as_bytes(stream_name)
+		print(f"  keeping external stream name {stream_name!r}")
+	else:
+		preamble += b"\x00"
 	for name in manis.names:
 		preamble += as_bytes(str(name))
 	root = as_bytes(manis.header)
@@ -338,6 +405,9 @@ def main():
 	for clip, mani_info in enumerate(manis.mani_infos):
 		blob = transforms[clip]
 		samples = fill_defaults(streams[blob].values, bind)
+		# Do this before any edit below, so everything downstream sees the clip
+		# at its declared length.
+		samples = close_wrap(samples, int(mani_info.frame_count), str(mani_info.name))
 		if args.scale_clip and any(
 				str(mani_info.name) == wanted or str(mani_info.name).endswith(wanted)
 				for wanted in args.scale_clip):
@@ -360,7 +430,9 @@ def main():
 				  f"rotated {args.yaw_deg:g} deg")
 		scalars = None
 		if blob + 1 < len(streams) and streams[blob + 1].track_type != QVVF:
-			scalars = streams[blob + 1].values
+			# The scalar stream wraps on the same clip, so it is short by one too.
+			scalars = close_wrap(streams[blob + 1].values, int(mani_info.frame_count),
+								 f"{mani_info.name} scalars")
 		overlay_mi = overlay_lut.get(str(mani_info.name))
 		frame_count = None
 		if overlay_mi is not None:

@@ -39,8 +39,15 @@ class MotiongraphLoader(MemStructLoader):
 
 	def accept_string(self, in_str):
 		"""Return True if string should receive replacement"""
-		# anims have @ eg. Acrocanthosaurus@JumpAttackDefendFlankLeft
-		if "@" in in_str:
+		# Animation references carry a species separator. JWE2 uses @, eg.
+		# Acrocanthosaurus@JumpAttackDefendFlankLeft; JWE3 uses $, eg.
+		# Deinosuchus$Partial_Unconscious. Measured over two JWE3 motiongraphs,
+		# all 1,319 animation references (<mani>, <anim_name>, <activity_name>)
+		# contain $ and none contain @, so accepting only @ silently skipped
+		# every one of them and rename contents did nothing on JWE3.
+		# Neither separator appears in the other game's strings, so accepting
+		# both is safe for JWE1/JWE2/PZ.
+		if "@" in in_str or "$" in in_str:
 			return True
-		# sound events don't, e.g. Acrocanthosaurus_FightReact
+		# sound events have neither, e.g. Acrocanthosaurus_FightReact
 		return self.motiongraph_rename_sound

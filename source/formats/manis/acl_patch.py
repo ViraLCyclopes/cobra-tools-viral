@@ -19,6 +19,10 @@ CONSTANT = 1
 ANIMATED = 2
 TRANSFORM_HEADER_OFFSET = 32
 DROP_W_FORMATS = (2, 3)
+SCALAR_TRACK_TYPE = 0
+SCALAR_HEADER_OFFSET = 32
+BIT_RATE_BITS_V9 = (0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 32)
+BIT_RATE_BITS = tuple(range(24)) + (32,)
 
 
 @dataclass(frozen=True)
@@ -40,11 +44,127 @@ class TransformLayout:
 	has_scale: bool
 
 
+@dataclass(frozen=True)
+class ScalarLayout:
+	num_tracks: int
+	version: int
+	num_bits_per_frame: int
+	metadata_offset: int
+	constant_values_offset: int
+	range_values_offset: int
+	animated_values_offset: int
+
+
 def fnv1a32(data: bytes) -> int:
 	value = 2166136261
 	for byte in data:
 		value = ((value ^ byte) * 16777619) & 0xFFFFFFFF
 	return value
+
+
+def parse_scalar_layout(blob: bytes) -> ScalarLayout:
+	"""Parse ACL 2.x float1 track storage used by MANIS scalar channels.
+
+	Offsets in ``scalar_tracks_header`` are relative to that header at byte 32.
+	The layout is documented by ACL 2.1's ``compressed_headers.h`` and
+	``write_track_data_impl.h``; keeping this separate from transform parsing
+	prevents the two unrelated headers from being conflated.
+	"""
+	header = read_blob_header(blob)
+	if header["track_type"] != SCALAR_TRACK_TYPE:
+		raise ValueError("ACL blob does not contain float1 scalar tracks")
+	if len(blob) != header["size"]:
+		raise ValueError(f"ACL blob is {len(blob)} bytes but declares {header['size']}")
+	fields = struct.unpack_from("<5I", blob, SCALAR_HEADER_OFFSET)
+	layout = ScalarLayout(
+		num_tracks=header["num_tracks"],
+		version=header["version"],
+		num_bits_per_frame=fields[0],
+		metadata_offset=fields[1],
+		constant_values_offset=fields[2],
+		range_values_offset=fields[3],
+		animated_values_offset=fields[4],
+	)
+	offsets = (layout.metadata_offset, layout.constant_values_offset,
+			   layout.range_values_offset, layout.animated_values_offset)
+	if offsets != tuple(sorted(offsets)):
+		raise ValueError(f"scalar data offsets are not monotonic: {offsets}")
+	if SCALAR_HEADER_OFFSET + layout.metadata_offset + layout.num_tracks > len(blob):
+		raise ValueError("scalar track metadata points outside ACL blob")
+	return layout
+
+
+def scalar_bit_rates(blob: bytes, layout: ScalarLayout | None = None) -> tuple[int, ...]:
+	if layout is None:
+		layout = parse_scalar_layout(blob)
+	base = SCALAR_HEADER_OFFSET + layout.metadata_offset
+	rates = tuple(blob[base:base + layout.num_tracks])
+	bits_table = BIT_RATE_BITS_V9 if layout.version == 9 else BIT_RATE_BITS
+	if any(rate >= len(bits_table) for rate in rates):
+		raise ValueError(f"invalid scalar bit rate in {rates}")
+	return rates
+
+
+def _scalar_num_bits(layout: ScalarLayout, bit_rate: int) -> int:
+	table = BIT_RATE_BITS_V9 if layout.version == 9 else BIT_RATE_BITS
+	return table[bit_rate]
+
+
+def _scalar_value_offset(blob: bytes, layout: ScalarLayout,
+						 track_index: int) -> tuple[str, int]:
+	if not 0 <= track_index < layout.num_tracks:
+		raise IndexError(f"track {track_index} outside 0..{layout.num_tracks - 1}")
+	rates = scalar_bit_rates(blob, layout)
+	rate = rates[track_index]
+	bits = _scalar_num_bits(layout, rate)
+	if bits == 0:
+		ordinal = sum(_scalar_num_bits(layout, item) == 0 for item in rates[:track_index])
+		return "constant", SCALAR_HEADER_OFFSET + layout.constant_values_offset + ordinal * 4
+	if bits == 32:
+		raise ValueError(f"scalar track {track_index} uses raw samples and has no range")
+	ordinal = sum(0 < _scalar_num_bits(layout, item) < 32 for item in rates[:track_index])
+	return "range", SCALAR_HEADER_OFFSET + layout.range_values_offset + ordinal * 8
+
+
+def read_scalar(blob: bytes, track_index: int) -> tuple[float, ...]:
+	"""Return a constant value or an animated track's (minimum, extent)."""
+	layout = parse_scalar_layout(blob)
+	kind, offset = _scalar_value_offset(blob, layout, track_index)
+	if kind == "constant":
+		return (struct.unpack_from("<f", blob, offset)[0],)
+	return struct.unpack_from("<2f", blob, offset)
+
+
+def patch_scalar_constant(blob: bytes, track_index: int, value: float) -> bytes:
+	if not math.isfinite(value):
+		raise ValueError("scalar value must be finite")
+	layout = parse_scalar_layout(blob)
+	kind, offset = _scalar_value_offset(blob, layout, track_index)
+	if kind != "constant":
+		raise ValueError(f"scalar track {track_index} is animated, not constant")
+	out = bytearray(blob)
+	struct.pack_into("<f", out, offset, value)
+	_rehash(out)
+	return bytes(out)
+
+
+def scale_scalar_range(blob: bytes, track_index: int, factor: float,
+					   pivot: float = 0.0) -> bytes:
+	"""Multiply one quantized float1 curve through its track-wide min/extent."""
+	if not math.isfinite(factor) or factor <= 0.0:
+		raise ValueError("scalar range factor must be finite and positive")
+	if not math.isfinite(pivot):
+		raise ValueError("scalar range pivot must be finite")
+	layout = parse_scalar_layout(blob)
+	kind, offset = _scalar_value_offset(blob, layout, track_index)
+	if kind != "range":
+		raise ValueError(f"scalar track {track_index} is constant, not animated")
+	minimum, extent = struct.unpack_from("<2f", blob, offset)
+	out = bytearray(blob)
+	struct.pack_into("<2f", out, offset,
+				 pivot + (minimum - pivot) * factor, extent * factor)
+	_rehash(out)
+	return bytes(out)
 
 
 def parse_transform_layout(blob: bytes) -> TransformLayout:
@@ -257,18 +377,22 @@ def read_animated_range(blob: bytes, kind: str,
 
 
 def scale_animated_range(blob: bytes, kind: str, track_index: int,
-						 factor: tuple[float, ...]) -> bytes:
+						 factor: tuple[float, ...],
+						 pivot: tuple[float, ...] = (0.0, 0.0, 0.0)) -> bytes:
 	"""Multiply an animated vector curve without changing its normalized samples."""
 	if len(factor) != 3 or not all(math.isfinite(value) and value > 0.0
 								  for value in factor):
 		raise ValueError("range factor must contain three finite positive floats")
+	if len(pivot) != 3 or not all(math.isfinite(value) for value in pivot):
+		raise ValueError("range pivot must contain three finite floats")
 	layout = parse_transform_layout(blob)
 	validate_layout(blob, layout)
 	offset = _animated_vector_range_offset(blob, layout, kind, track_index)
 	minimum, extent = read_animated_range(blob, kind, track_index)
 	out = bytearray(blob)
 	struct.pack_into("<3f", out, offset,
-				 *(value * multiplier for value, multiplier in zip(minimum, factor)))
+				 *(origin + (value - origin) * multiplier
+				   for value, multiplier, origin in zip(minimum, factor, pivot)))
 	struct.pack_into("<3f", out, offset + 12,
 				 *(value * multiplier for value, multiplier in zip(extent, factor)))
 	_rehash(out)

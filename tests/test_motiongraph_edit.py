@@ -7,7 +7,10 @@ from source.formats.motiongraph.edit import (
     build_patch_plan,
     curve_decode,
     curve_encode,
+    load_plan,
     locate_fields,
+    merge_patch_plans,
+    save_plan,
 )
 from source.formats.motiongraph.report import derive_label, strip_species
 
@@ -65,6 +68,64 @@ def test_duplicate_addresses_are_patched_once(tmp_path):
         rows, source, "species.motiongraph", "speed.float", value=2.0,
     )
     assert len(plan["edits"]) == 1
+
+
+def test_mixed_value_plans_merge_into_one_atomic_queue(tmp_path):
+    source = tmp_path / "stock.ovl"
+    source.write_bytes(b"stock")
+    first = build_patch_plan(
+        field_row(), source, "species.motiongraph", "speed.float", value=1.25,
+    )
+    second_rows = field_row()
+    second_rows[0]["fields"][0]["offset"] = 40
+    second = build_patch_plan(
+        second_rows, source, "species.motiongraph", "blend_time", value=2.5,
+    )
+    merged = merge_patch_plans([first, second])
+    assert merged["field"] == "multiple"
+    assert merged["kind"] == "mixed"
+    assert [operation["value"] for operation in merged["operations"]] == [1.25, 2.5]
+    assert [(edit["pool"], edit["offset"]) for edit in merged["edits"]] == [(10, 32), (10, 40)]
+
+
+def test_merge_deduplicates_an_identical_queued_operation(tmp_path):
+    source = tmp_path / "stock.ovl"
+    source.write_bytes(b"stock")
+    plan = build_patch_plan(
+        field_row(), source, "species.motiongraph", "speed.float", value=1.25,
+    )
+    merged = merge_patch_plans([plan, plan])
+    assert len(merged["operations"]) == 1
+    assert len(merged["edits"]) == 1
+
+
+def test_merge_rejects_conflicting_or_overlapping_edits(tmp_path):
+    source = tmp_path / "stock.ovl"
+    source.write_bytes(b"stock")
+    first = build_patch_plan(
+        field_row(), source, "species.motiongraph", "speed.float", value=1.25,
+    )
+    conflict = build_patch_plan(
+        field_row(), source, "species.motiongraph", "speed.float", value=2.5,
+    )
+    with pytest.raises(ValueError, match="Conflicting queued edits"):
+        merge_patch_plans([first, conflict])
+    overlap = {**conflict, "edits": [{**conflict["edits"][0], "offset": 34}]}
+    with pytest.raises(ValueError, match="Overlapping queued edits"):
+        merge_patch_plans([first, overlap])
+
+
+def test_saved_composite_queue_loads_and_validates(tmp_path):
+    source = tmp_path / "stock.ovl"
+    source.write_bytes(b"stock")
+    plan = build_patch_plan(
+        field_row(), source, "species.motiongraph", "speed.float", value=1.25,
+    )
+    path = tmp_path / "queue.json"
+    save_plan(path, merge_patch_plans([plan]))
+    loaded = load_plan(path)
+    assert loaded["source_sha256"] == plan["source_sha256"]
+    assert loaded["edits"] == plan["edits"]
 
 
 def test_unverified_address_refuses_a_plan(tmp_path):

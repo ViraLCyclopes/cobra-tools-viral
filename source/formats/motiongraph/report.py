@@ -149,6 +149,11 @@ def derive_label(clips_by_depth, types, stream_names, state_frequency,
 
 def analyze_states(loader):
     deref = build_deref(loader)
+    activity_addresses = {
+        id(value): (int(pool.i), int(offset))
+        for (pool, offset), value in loader.context.recursion.items()
+        if type(value).__name__ == "Activity"
+    }
     header = loader.header
     state_array = deref(header.state_output_entries)
     references = deref(state_array.states)
@@ -169,10 +174,13 @@ def analyze_states(loader):
             rows.append(None)
             continue
         clips_by_depth, types, streams = defaultdict(list), Counter(), []
-        total_nodes, seen = 0, set()
+        total_nodes, seen, addresses = 0, set(), set()
         for reference in (deref(state.activities) or []):
             for node, depth in collect_subtree(deref(reference.activity), deref, seen):
                 total_nodes += 1
+                address = activity_addresses.get(id(node))
+                if address is not None:
+                    addresses.add(address)
                 activity_type = node.data_type.data
                 types[activity_type] += 1
                 clips_by_depth[depth].extend(activity_clips(node, deref))
@@ -209,6 +217,7 @@ def analyze_states(loader):
             "clips": sorted({strip_species(name) for name in all_clips}),
             "types": dict(types), "streams": streams, "edges": edges,
             "inbound_decisions": Counter(inbound.get(id(state), [])),
+            "activity_addresses": sorted(addresses),
         })
     valid = [row for row in rows if row]
     frequency = Counter()
@@ -252,12 +261,20 @@ def build_activity_tree(loader, state_index: int, max_nodes: int = 5000):
                     return value
         return None
 
+    def source_address(pointer):
+        pool = getattr(pointer, "src_pool", None)
+        offset = getattr(pointer, "io_start", None)
+        if pool is None or offset is None or int(offset) < 0:
+            return None
+        return int(pool.i), int(offset)
+
     def children_of(activity, payload):
         children = []
         for attr in ("sub_activities", "other_activities"):
             array = deref(getattr(activity, attr, None))
             for index, reference in enumerate(array or []):
-                children.append((f"{attr}[{index}]", deref(getattr(reference, "activity", None))))
+                pointer = getattr(reference, "activity", None)
+                children.append((f"{attr}[{index}]", deref(pointer), pointer))
         if payload is None:
             return children
         for attr in CHILD_ACTIVITY_FIELDS:
@@ -266,7 +283,7 @@ def build_activity_tree(loader, state_index: int, max_nodes: int = 5000):
                 continue
             target = deref(field)
             if type(target).__name__ == "Activity":
-                children.append((attr, target))
+                children.append((attr, target, field))
                 continue
             try:
                 entries = list(target or [])
@@ -278,10 +295,10 @@ def build_activity_tree(loader, state_index: int, max_nodes: int = 5000):
                     reference = getattr(entry, "Activity", None)
                 child = deref(reference)
                 if child is not None:
-                    children.append((f"{attr}[{index}]", child))
+                    children.append((f"{attr}[{index}]", child, reference))
         return children
 
-    def render(activity, relationship):
+    def render(activity, relationship, inbound_pointer=None):
         nonlocal count
         if type(activity).__name__ != "Activity":
             return None
@@ -291,6 +308,8 @@ def build_activity_tree(loader, state_index: int, max_nodes: int = 5000):
                 "relationship": relationship, "activity_type": "shared reference",
                 "label": f"see node {seen[identity]}", "clips": [], "children": [],
                 "shared": True, "target_node": seen[identity],
+                "address": activity_addresses.get(identity),
+                "inbound_source": source_address(inbound_pointer),
             }
         if count >= max_nodes:
             return {
@@ -307,21 +326,24 @@ def build_activity_tree(loader, state_index: int, max_nodes: int = 5000):
             "relationship": relationship,
             "node": number,
             "address": activity_addresses.get(identity),
+            "inbound_source": source_address(inbound_pointer),
             "activity_type": activity.data_type.data,
             "label": activity_name(activity, payload),
             "clips": clips,
             "children": [],
             "shared": False,
         }
-        for child_relationship, child in children_of(activity, payload):
-            rendered = render(child, child_relationship)
+        for child_relationship, child, pointer in children_of(activity, payload):
+            rendered = render(child, child_relationship, pointer)
             if rendered is not None:
                 node["children"].append(rendered)
         return node
 
     roots = []
     for index, reference in enumerate(deref(state.activities) or []):
-        root = render(deref(reference.activity), f"state.activities[{index}]")
+        root = render(
+            deref(reference.activity), f"state.activities[{index}]", reference.activity
+        )
         if root is not None:
             roots.append(root)
     return roots, count

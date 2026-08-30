@@ -4,12 +4,15 @@ import os
 import pytest
 import numpy as np
 
-from source.formats.manis.acl import decode_file
+from source.formats.manis.acl import decode_blob, decode_file
 from source.formats.manis.acl_patch import (
 	CONSTANT,
 	fnv1a32,
 	parse_transform_layout,
 	patch_constant,
+	parse_scalar_layout,
+	read_scalar,
+	scale_scalar_range,
 	read_animated_range,
 	read_constant,
 	scale_animated_range,
@@ -38,6 +41,15 @@ def rest01_blob():
 	transforms = [(offset, size) for offset, size in list_clip_blobs(data)
 				  if read_blob_header(data, offset)["track_type"] == 12]
 	offset, size = transforms[10]
+	return data[offset:offset + size]
+
+
+def animated_scalar_blob():
+	data = open(MANIS, "rb").read()
+	scalars = [(offset, size) for offset, size in list_clip_blobs(data)
+			   if read_blob_header(data, offset)["track_type"] == 0]
+	# Clip 0 has an animated BlendHeadLookOut channel at scalar track 0.
+	offset, size = scalars[0]
 	return data[offset:offset + size]
 
 
@@ -89,6 +101,33 @@ def test_animated_head_scale_range_is_size_preserving_and_rehashed():
 	assert int.from_bytes(patched[4:8], "little") == fnv1a32(patched[8:])
 	assert patched_minimum == pytest.approx(tuple(value * 1.5 for value in minimum))
 	assert patched_extent == pytest.approx(tuple(value * 1.5 for value in extent))
+
+
+def test_animated_range_can_preserve_nonzero_first_sample():
+	blob = rest01_blob()
+	decoded = decode_blob(blob).values
+	pivot = tuple(float(value) for value in decoded[0, 81, 7:10])
+	patched = scale_animated_range(blob, "scale", 81, (2.0, 2.0, 2.0), pivot)
+	patched_values = decode_blob(patched).values
+	assert patched_values[0, 81, 7:10] == pytest.approx(pivot, abs=1.0e-6)
+	expected = np.asarray(pivot) + (decoded[:, 81, 7:10] - np.asarray(pivot)) * 2.0
+	assert patched_values[:, 81, 7:10] == pytest.approx(expected, abs=2.0e-6)
+
+
+def test_scalar_range_is_size_preserving_rehashed_and_decodes_scaled():
+	blob = animated_scalar_blob()
+	layout = parse_scalar_layout(blob)
+	assert layout.num_tracks == 11
+	minimum, extent = read_scalar(blob, 0)
+	patched = scale_scalar_range(blob, 0, 2.0)
+	patched_minimum, patched_extent = read_scalar(patched, 0)
+	assert len(patched) == len(blob)
+	assert int.from_bytes(patched[4:8], "little") == fnv1a32(patched[8:])
+	assert patched_minimum == pytest.approx(minimum * 2.0)
+	assert patched_extent == pytest.approx(extent * 2.0)
+	original_values = decode_blob(blob).values[:, 0, 0]
+	patched_values = decode_blob(patched).values[:, 0, 0]
+	assert patched_values == pytest.approx(original_values * 2.0, abs=1.0e-6)
 
 
 def test_database_rekey_preserves_every_other_decoded_value(tmp_path):

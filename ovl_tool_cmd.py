@@ -11,6 +11,9 @@ Subcommands:
   motiongraph-fields - inspect fields and optionally create a fixed-size patch plan
   motiongraph-apply  - apply a verified patch plan without rebuilding topology
   motiongraph-report - render the anonymous state graph or decision tree
+  motiongraph-capacity - audit reusable allocation slack and dormant topology
+  motiongraph-census   - count decoded graph objects; diff two builds for orphans
+  motiongraph-grow-null-prefix - experimental fixed-pool logical array growth
   motiongraph-retarget-clip - repoint references to an existing same-pool clip string
   motiongraph-string-slot   - replace text within one existing string allocation
 
@@ -526,6 +529,119 @@ def cmd_motiongraph_report(args: argparse.Namespace) -> None:
         )
 
 
+def cmd_motiongraph_census(args: argparse.Namespace) -> None:
+    """Census decoded motiongraph objects, optionally diffing two builds.
+
+    A decoded object is only reachable through a live pointer chain, so an edit
+    that redirects an allocation's last inbound reference silently removes it
+    from the graph while every size and reload check still passes. Diffing two
+    censuses is the check that catches it.
+    """
+    from pathlib import Path
+    from source.formats.motiongraph.capacity import census, diff_census
+    from source.formats.motiongraph.edit import load_motiongraph
+
+    game = resolve_game_label(args.game)
+    source = Path(args.ovl).resolve()
+    ensure_exists(str(source), "file")
+    try:
+        _, loader = load_motiongraph(source, args.name, game)
+        current = census(loader)
+    except Exception as exc:
+        die(f"motiongraph census failed: {exc}")
+    if not args.against:
+        print(f"total_decoded={current['total']}")
+        for name, count in sorted(current["counts"].items(), key=lambda row: (-row[1], row[0])):
+            print(f"{count:8d}  {name}")
+        return
+
+    baseline_path = Path(args.against).resolve()
+    ensure_exists(str(baseline_path), "file")
+    try:
+        _, baseline_loader = load_motiongraph(baseline_path, args.name, game)
+        difference = diff_census(census(baseline_loader), current)
+    except Exception as exc:
+        die(f"motiongraph census diff failed: {exc}")
+    print(
+        f"total {difference['total_before']} -> {difference['total_after']} "
+        f"(added={difference['added']} removed={difference['removed']})"
+    )
+    for name, row in sorted(difference["changed_types"].items()):
+        print(f"{name}: {row['before']} -> {row['after']}")
+        for address in row["added"]:
+            print(f"    + {address[0]}:{address[1]}")
+        for address in row["removed"]:
+            print(f"    - {address[0]}:{address[1]}")
+    if not difference["changed_types"]:
+        print("no decoded object changed")
+    if difference["removed"]:
+        logging.warning(
+            "%d decoded object(s) disappeared - their allocations are now orphaned "
+            "and their bytes are absorbed into the preceding allocation",
+            difference["removed"],
+        )
+
+
+def cmd_motiongraph_capacity(args: argparse.Namespace) -> None:
+    """Audit allocation slack and graph objects without modifying the source."""
+    from pathlib import Path
+    from source.formats.motiongraph.capacity import build_capacity_audit, render_capacity_markdown
+    from source.formats.motiongraph.edit import load_motiongraph
+
+    source = Path(args.ovl).resolve()
+    output = Path(args.output).resolve()
+    ensure_exists(str(source), "file")
+    try:
+        _, loader = load_motiongraph(source, args.name, resolve_game_label(args.game))
+        audit = build_capacity_audit(loader, source)
+        report = render_capacity_markdown(audit)
+    except Exception as exc:
+        die(f"motiongraph capacity audit failed: {exc}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(report, encoding="utf-8")
+    logging.success("Wrote topology-capacity report: %s", output)
+    if args.json:
+        json_path = Path(args.json).resolve()
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+        logging.success("Wrote topology-capacity JSON: %s", json_path)
+    summary, reach = audit["summary"], audit["reachability"]
+    print(
+        f"allocations={summary['allocations']} "
+        f"reusable_arrays={summary['counted_arrays_with_reusable_slots']} "
+        f"candidate_slots={summary['reusable_array_slots']} "
+        f"adjacent_growth={summary['adjacent_growth_candidates']} "
+        f"dormant_activities={len(reach['dormant_activities'])} "
+        f"no_inbound_states={len(reach['no_known_inbound_states'])}"
+    )
+
+
+def cmd_motiongraph_grow_null_prefix(args: argparse.Namespace) -> None:
+    """Run the fixed-pool null-prefix topology-growth experiment."""
+    from pathlib import Path
+    from source.formats.motiongraph.surgical_growth import grow_null_prefix
+
+    _check_staged_output(args)
+    try:
+        report = grow_null_prefix(
+            Path(args.ovl), Path(args.output), args.array_pool, args.array_offset,
+            name=args.name, game=resolve_game_label(args.game),
+            allow_eight_alignment=args.allow_8_byte_alignment,
+        )
+    except Exception as exc:
+        die(f"motiongraph null-prefix growth failed: {exc}")
+    logging.success(
+        "Grew counted array %d:%d -> %d from %d to %d entries",
+        report.pool, report.old_offset, report.new_offset,
+        report.old_count, report.new_count,
+    )
+    logging.success(
+        "Fixed archive topology retained: %d pools, %d fragments, %d uncompressed bytes",
+        report.pools, report.fragments, report.uncompressed_size,
+    )
+    logging.success("Wrote and decoded staged experiment: %s", report.output)
+
+
 def _check_staged_output(args: argparse.Namespace):
     output = os.path.abspath(args.output)
     if os.path.exists(output) and not args.force:
@@ -801,6 +917,64 @@ def build_parser() -> argparse.ArgumentParser:
         choices=game_vals if game_vals else None,
     )
     p_mgr.set_defaults(func=cmd_motiongraph_report)
+
+    # motiongraph-capacity
+    p_mgc = sub.add_parser(
+        "motiongraph-capacity",
+        help="Audit reusable allocation slack and dormant motiongraph topology.",
+    )
+    p_mgc.add_argument("ovl", help="Source OVL containing the motiongraph; never modified.")
+    p_mgc.add_argument("-o", "--output", required=True, help="Markdown report path.")
+    p_mgc.add_argument("--json", help="Optional complete structured audit path.")
+    p_mgc.add_argument(
+        "--name", help="Internal .motiongraph name; auto-detected when exactly one exists.",
+    )
+    p_mgc.add_argument(
+        "-g", "--game", default="Jurassic World Evolution 3",
+        choices=game_vals if game_vals else None,
+    )
+    p_mgc.set_defaults(func=cmd_motiongraph_capacity)
+
+    # motiongraph-census
+    p_mgn = sub.add_parser(
+        "motiongraph-census",
+        help="Count decoded motiongraph objects; --against diffs two builds.",
+    )
+    p_mgn.add_argument("ovl", help="OVL containing the motiongraph; never modified.")
+    p_mgn.add_argument(
+        "--against", help="Baseline OVL to diff against, e.g. the build this one was made from.",
+    )
+    p_mgn.add_argument(
+        "--name", help="Internal .motiongraph name; auto-detected when exactly one exists.",
+    )
+    p_mgn.add_argument(
+        "-g", "--game", default="Jurassic World Evolution 3",
+        choices=game_vals if game_vals else None,
+    )
+    p_mgn.set_defaults(func=cmd_motiongraph_census)
+
+    # motiongraph-grow-null-prefix
+    p_mgg = sub.add_parser(
+        "motiongraph-grow-null-prefix",
+        help="Experimental: prepend a null array entry using adjacent padding.",
+    )
+    p_mgg.add_argument("ovl", help="Pristine source OVL; never overwritten.")
+    p_mgg.add_argument("-o", "--output", required=True, help="Same-named OVL in a full stage.")
+    p_mgg.add_argument("--array-pool", type=int, required=True, help="Global pool index.")
+    p_mgg.add_argument("--array-offset", type=int, required=True, help="Current array offset.")
+    p_mgg.add_argument(
+        "--allow-8-byte-alignment", action="store_true",
+        help="Explicitly permit moving an 8-byte element array to an 8-mod-16 target.",
+    )
+    p_mgg.add_argument(
+        "--name", help="Internal .motiongraph name; auto-detected when exactly one exists.",
+    )
+    p_mgg.add_argument(
+        "-g", "--game", default="Jurassic World Evolution 3",
+        choices=game_vals if game_vals else None,
+    )
+    p_mgg.add_argument("--force", action="store_true", help="Replace the staged main OVL.")
+    p_mgg.set_defaults(func=cmd_motiongraph_grow_null_prefix)
 
     # motiongraph-retarget-clip
     p_mgret = sub.add_parser(

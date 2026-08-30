@@ -401,6 +401,106 @@ def save_plan(path: Path, plan: dict) -> None:
     path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
 
 
+def _plan_operations(plan: dict) -> list[dict]:
+    operations = plan.get("operations")
+    if operations:
+        return [dict(operation) for operation in operations]
+    return [{
+        "field": plan.get("field"), "kind": plan.get("kind"),
+        "value": plan.get("value"), "flags": plan.get("flags"),
+        "enum": plan.get("enum"), "edit_count": len(plan.get("edits") or []),
+    }]
+
+
+def merge_patch_plans(plans: Iterable[dict]) -> dict:
+    """Combine independently built edits into one safe, atomic patch plan.
+
+    Exact duplicate edits are collapsed. Any incompatible source identity,
+    motiongraph, or overlapping byte range is rejected before staging.
+    """
+    plans = list(plans)
+    if not plans:
+        raise ValueError("Choose at least one patch plan to merge")
+    first = plans[0]
+    expected_format = "cobra-motiongraph-patch-v1"
+    source_hash = str(first.get("source_sha256") or "").lower()
+    motiongraph = first.get("motiongraph")
+    edits: list[dict] = []
+    operations: list[dict] = []
+    occupied: dict[tuple[int, int], int] = {}
+    exact: dict[tuple[int, int, int], tuple[str, str]] = {}
+
+    for plan in plans:
+        if plan.get("format") not in (None, expected_format):
+            raise ValueError(f"Unsupported patch-plan format: {plan.get('format')!r}")
+        candidate_hash = str(plan.get("source_sha256") or "").lower()
+        if candidate_hash != source_hash:
+            raise ValueError("Patch plans were built from different source OVL bytes")
+        candidate_motiongraph = plan.get("motiongraph")
+        if str(candidate_motiongraph or "").lower() != str(motiongraph or "").lower():
+            raise ValueError("Patch plans target different motiongraphs")
+        plan_edits = plan.get("edits") or []
+        if not plan_edits:
+            raise ValueError("Patch plan contains no edits")
+        plan_operations = _plan_operations(plan)
+        new_edits = 0
+        for edit in plan_edits:
+            pool, offset = int(edit["pool"]), int(edit["offset"])
+            expected = bytes.fromhex(edit["expected"])
+            replacement = bytes.fromhex(edit["replacement"])
+            if not expected or len(expected) != len(replacement):
+                raise ValueError(f"Invalid or width-changing edit at pool {pool}:{offset}")
+            key = (pool, offset, len(expected))
+            payload = (expected.hex(), replacement.hex())
+            if key in exact:
+                if exact[key] != payload:
+                    raise ValueError(f"Conflicting queued edits at pool {pool}:{offset}")
+                continue
+            collision = next(
+                (occupied[(pool, byte)] for byte in range(offset, offset + len(expected))
+                 if (pool, byte) in occupied),
+                None,
+            )
+            if collision is not None:
+                raise ValueError(
+                    f"Overlapping queued edits at pool {pool}:{offset} and edit #{collision + 1}"
+                )
+            edit_index = len(edits)
+            for byte in range(offset, offset + len(expected)):
+                occupied[(pool, byte)] = edit_index
+            exact[key] = payload
+            edits.append(dict(edit))
+            new_edits += 1
+        if new_edits or not operations:
+            operations.extend(plan_operations)
+
+    if len(operations) == 1:
+        operation = operations[0]
+        field, kind = operation.get("field"), operation.get("kind")
+        value, flags, enum_name = (
+            operation.get("value"), operation.get("flags"), operation.get("enum")
+        )
+    else:
+        field, kind, value, flags, enum_name = "multiple", "mixed", None, None, None
+    return {
+        "format": expected_format, "source": first.get("source"),
+        "source_sha256": first.get("source_sha256"), "motiongraph": motiongraph,
+        "field": field, "kind": kind, "value": value, "flags": flags,
+        "enum": enum_name, "operations": operations, "edits": edits,
+    }
+
+
+def load_plan(path: Path) -> dict:
+    """Load and structurally validate a saved patch plan."""
+    try:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not load patch plan: {exc}") from exc
+    if not isinstance(plan, dict):
+        raise ValueError("Patch plan root must be a JSON object")
+    return merge_patch_plans([plan])
+
+
 def apply_patch_plan(source: Path, output: Path, plan: dict,
                      game: str = DEFAULT_GAME) -> PatchReport:
     """Apply a plan by recompressing STATIC only, preserving its topology."""
