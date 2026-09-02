@@ -23,6 +23,24 @@ from source.formats.motiongraph.edit import (
 	save_plan,
 )
 from source.formats.motiongraph.clone import clone_complete_animation_activity
+from source.formats.motiongraph.capacity import (
+	audit_adjacent_growth,
+	audit_allocations,
+	audit_dead_space,
+	build_capacity_audit,
+	census,
+	diff_census,
+	render_capacity_markdown,
+)
+from source.formats.motiongraph.chooser_growth import (
+	grow_random_animation_chooser,
+	list_choosers,
+	set_chooser_weights,
+)
+from source.formats.motiongraph.rename_repair import (
+	repoint_stale_species_strings,
+	survey_stale_references,
+)
 from source.formats.motiongraph.report import (
 	build_activity_tree,
 	build_decision_graph,
@@ -375,7 +393,10 @@ class MainWindow(window.MainWindow):
 		self._build_decisions_tab()
 		self._build_fields_tab()
 		self._build_clone_tab()
+		self._build_chooser_tab()
 		self._build_retarget_tab()
+		self._build_rename_repair_tab()
+		self._build_capacity_tab()
 		self._build_stage_tab()
 
 		# The body was initially inserted directly by MainWindow. Reparent it into
@@ -761,6 +782,128 @@ class MainWindow(window.MainWindow):
 		form.addRow(slot_button)
 		self.tabs.addTab(page, "Clip Retarget")
 
+	def _build_chooser_tab(self):
+		page = QtWidgets.QWidget()
+		layout = QtWidgets.QVBoxLayout(page)
+		info = QtWidgets.QLabel(
+			"A <b>RandomAnimationActivity</b> picks among clips BY NAME, so adding one needs no "
+			"activity wrapper, payload, state or edge - far cheaper than cloning. Weights are "
+			"relative; the engine draws from their sum, so the share is what actually matters."
+		)
+		info.setWordWrap(True)
+		layout.addWidget(info)
+		note = QtWidgets.QLabel(
+			"Weights are reachable as animations[N].weight in Fields / Edit, but nobody finds them "
+			"that way. Adding a clip RELOCATES the entry array into a tail pool - game-verified, but "
+			"it is topology growth, so re-load the staged file and check the log."
+		)
+		note.setWordWrap(True)
+		note.setStyleSheet("color: #ffe075; padding: 4px 0;")
+		layout.addWidget(note)
+
+		filter_row = QtWidgets.QHBoxLayout()
+		self.chooser_filter = QtWidgets.QLineEdit()
+		self.chooser_filter.setPlaceholderText("Filter by clip substring, e.g. Rest or Eat")
+		refresh = QtWidgets.QPushButton("List choosers")
+		refresh.clicked.connect(self.refresh_choosers)
+		filter_row.addWidget(QtWidgets.QLabel("Match"))
+		filter_row.addWidget(self.chooser_filter, 1)
+		filter_row.addWidget(refresh)
+		layout.addLayout(filter_row)
+
+		self.chooser_tree = QtWidgets.QTreeWidget()
+		self.chooser_tree.setHeaderLabels(["Chooser / clip", "Weight", "Share", "Detail"])
+		self.chooser_tree.setColumnWidth(0, 340)
+		self.chooser_tree.itemSelectionChanged.connect(self.chooser_selected)
+		layout.addWidget(self.chooser_tree, 1)
+
+		form = QtWidgets.QFormLayout()
+		self.chooser_target = QtWidgets.QLabel("No chooser selected")
+		form.addRow("Selected", self.chooser_target)
+		self.chooser_weights = QtWidgets.QLineEdit()
+		self.chooser_weights.setPlaceholderText("Comma-separated weights for every clip, in order")
+		form.addRow("Weights", self.chooser_weights)
+		weight_button = QtWidgets.QPushButton("Apply weights to staged family")
+		weight_button.clicked.connect(self.apply_chooser_weights)
+		form.addRow(weight_button)
+		line = QtWidgets.QFrame()
+		line.setFrameShape(QtWidgets.QFrame.HLine)
+		form.addRow(line)
+		self.chooser_add_clip = QtWidgets.QLineEdit()
+		self.chooser_add_clip.setPlaceholderText("Full clip name, e.g. Species$Rest03")
+		form.addRow("Add clip", self.chooser_add_clip)
+		self.chooser_add_weight = QtWidgets.QSpinBox()
+		self.chooser_add_weight.setRange(1, 10000)
+		self.chooser_add_weight.setValue(1)
+		form.addRow("Its weight", self.chooser_add_weight)
+		add_button = QtWidgets.QPushButton("Add clip to chooser in staged family")
+		add_button.clicked.connect(self.apply_chooser_add)
+		form.addRow(add_button)
+		layout.addLayout(form)
+		self.tabs.addTab(page, "Choosers")
+
+	def _build_capacity_tab(self):
+		page = QtWidgets.QWidget()
+		layout = QtWidgets.QVBoxLayout(page)
+		info = QtWidgets.QLabel(
+			"Where the room is: tail space, allocations with adjacent padding that could absorb one "
+			"more element, and what is decoded but unreachable. Consult this BEFORE attempting growth."
+		)
+		info.setWordWrap(True)
+		layout.addWidget(info)
+		warn = QtWidgets.QLabel(
+			"A reported 'dead tail' has already turned out to hold LIVE STRINGS. Read the bytes "
+			"before reusing any space this panel offers."
+		)
+		warn.setWordWrap(True)
+		warn.setStyleSheet("color: #ffe075; padding: 4px 0;")
+		layout.addWidget(warn)
+		run = QtWidgets.QPushButton("Run capacity audit on the loaded motiongraph")
+		run.clicked.connect(self.run_capacity_audit)
+		layout.addWidget(run)
+		self.capacity_text = QtWidgets.QPlainTextEdit()
+		self.capacity_text.setReadOnly(True)
+		self.capacity_text.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+		layout.addWidget(self.capacity_text, 1)
+		self.tabs.addTab(page, "Capacity")
+
+	def _build_rename_repair_tab(self):
+		page = QtWidgets.QWidget()
+		layout = QtWidgets.QVBoxLayout(page)
+		info = QtWidgets.QLabel(
+			"Renaming a species rewrites clip names inside the .manis, but graph references can be "
+			"left pointing at the OLD <b>&lt;Token&gt;$Clip</b> strings. Such a reference names a clip "
+			"that exists in no bundle, so whatever plays it has NO ANIMATION - and nothing reports an "
+			"error, at load or at runtime. Survey first; the repair is a pure fragment repoint."
+		)
+		info.setWordWrap(True)
+		layout.addWidget(info)
+		form = QtWidgets.QFormLayout()
+		self.rename_old = QtWidgets.QLineEdit()
+		self.rename_old.setPlaceholderText("Pre-rename token, e.g. Sarcmimsaee")
+		self.rename_new = QtWidgets.QLineEdit()
+		self.rename_new.setPlaceholderText("Current token, e.g. Viralsarcosuchus")
+		form.addRow("Old token", self.rename_old)
+		form.addRow("New token", self.rename_new)
+		survey_button = QtWidgets.QPushButton("Survey stale references (read-only)")
+		survey_button.clicked.connect(self.run_rename_survey)
+		form.addRow(survey_button)
+		repair_button = QtWidgets.QPushButton("Repoint stale references in staged family")
+		repair_button.clicked.connect(self.apply_rename_repair)
+		form.addRow(repair_button)
+		layout.addLayout(form)
+		self.rename_text = QtWidgets.QPlainTextEdit()
+		self.rename_text.setReadOnly(True)
+		layout.addWidget(self.rename_text, 1)
+		hint = QtWidgets.QLabel(
+			"Note: a whole-OVL extract diff is BLIND to this edit - the extracted .motiongraph is the "
+			"source XML and already carries the correct names. Verify by re-surveying, not by diffing."
+		)
+		hint.setWordWrap(True)
+		hint.setStyleSheet("color: #9aa0a6;")
+		layout.addWidget(hint)
+		self.tabs.addTab(page, "Rename Repair")
+
 	def _build_stage_tab(self):
 		page = QtWidgets.QWidget()
 		layout = QtWidgets.QVBoxLayout(page)
@@ -789,6 +932,55 @@ class MainWindow(window.MainWindow):
 		warning.setWordWrap(True)
 		layout.addWidget(warning)
 		self.tabs.addTab(page, "Stage / Apply")
+
+	def census_guard(self, label: str, expect_added: int | None = None,
+					 expect_removed: int = 0) -> dict | None:
+		"""Census the staged output against the source after a write.
+
+		This is a GUARD, not a report. Cloning can take over every inbound
+		reference of its donor, leaving the donor unreachable: it is never decoded
+		again and its bytes are absorbed into the preceding allocation. Raw AND
+		semantic reload both pass on that build, so a census diff is the only
+		detector. Anything unexpected is surfaced loudly rather than logged
+		quietly, because the failure is silent everywhere else.
+
+		Returns the diff, or None if it could not be taken - a guard that cannot
+		run must say so rather than imply a pass.
+		"""
+		try:
+			name = self.name_edit.text().strip() or None
+			_ovl_a, loader_a = load_motiongraph(self.source_path(), name, DEFAULT_GAME)
+			_ovl_b, loader_b = load_motiongraph(self.output_path(), name, DEFAULT_GAME)
+			delta = diff_census(census(loader_a), census(loader_b))
+		except Exception as exc:
+			logging.warning(f"census guard could not run after {label}: {exc}")
+			self.status_bar.showMessage(
+				f"{label}: census guard COULD NOT RUN ({exc}) - verify manually", 15000)
+			return None
+		added, removed = delta["added"], delta["removed"]
+		logging.info(
+			f"census guard after {label}: total {delta['total_before']} -> "
+			f"{delta['total_after']} (added={added} removed={removed})")
+		for type_name, row in delta["changed_types"].items():
+			logging.info(
+				f"    {type_name}: {row['before']} -> {row['after']} "
+				f"(+{len(row['added'])} / -{len(row['removed'])})")
+		problems = []
+		if removed != expect_removed:
+			problems.append(
+				f"{removed} decoded object(s) DISAPPEARED (expected {expect_removed}). "
+				"That is the orphaned-donor signature: reload will still pass.")
+		if expect_added is not None and added != expect_added:
+			problems.append(f"added {added} object(s), expected {expect_added}")
+		if problems:
+			self.showerror(
+				f"Census guard failed after {label}:\n\n" + "\n\n".join(problems)
+				+ "\n\nThe staged family is suspect. Do not install it."
+			)
+		else:
+			self.status_bar.showMessage(
+				f"{label}: census guard OK (+{added} / -{removed})", 10000)
+		return delta
 
 	def source_path(self) -> Path:
 		path = Path(self.source_edit.text().strip())
@@ -1657,6 +1849,9 @@ class MainWindow(window.MainWindow):
 				f"Applied and reloaded staged patch: {report.edits} edits, "
 				f"{report.changed_bytes} changed bytes"
 			)
+			# Fixed-width value edits inside existing slots: the object set must be
+			# untouched. A change here means the plan hit something structural.
+			self.census_guard("patch plan", expect_added=0, expect_removed=0)
 		except Exception as exc:
 			self.showerror(str(exc))
 
@@ -1694,6 +1889,20 @@ class MainWindow(window.MainWindow):
 				f"inbound={report.inbound_references}, fragments=+{report.cloned_fragments}, "
 				f"sentinels={report.moved_end_sentinels}, speed={report.speed}"
 			)
+			# clone.py census-guards internally, but the GUI never surfaced the one
+			# outcome a user cannot see any other way: taking over ALL of a donor's
+			# inbound references leaves it unreachable, and both raw and semantic
+			# reload still pass on that build.
+			if getattr(report, "orphaned_donor", False):
+				self.showerror(
+					"Clone succeeded, but it took over EVERY inbound reference of its "
+					f"donor at {report.donor_wrapper}.\n\n"
+					"The donor is now unreachable: it will never be decoded again and "
+					"its bytes are absorbed into the preceding allocation. Reload and "
+					"validation both still pass, so nothing else will warn you.\n\n"
+					"If you meant to keep the original behaviour on some edges, redo "
+					"this with Redirect scope = 'Only selected state occurrence'."
+				)
 		except Exception as exc:
 			self.showerror(str(exc))
 
@@ -1709,6 +1918,8 @@ class MainWindow(window.MainWindow):
 			logging.info(
 				f"Retargeted {report.references} references and reloaded the staged archive family"
 			)
+			# A pure repoint must not change the decoded object set at all.
+			self.census_guard("clip retarget", expect_added=0, expect_removed=0)
 		except Exception as exc:
 			self.showerror(str(exc))
 
@@ -1724,6 +1935,178 @@ class MainWindow(window.MainWindow):
 			logging.info(
 				f"Replaced string slot and verified staged family: {report.changed_bytes} changed bytes"
 			)
+			self.census_guard("string-slot replacement", expect_added=0, expect_removed=0)
+		except Exception as exc:
+			self.showerror(str(exc))
+
+	# ---- Choosers -------------------------------------------------------
+
+	def refresh_choosers(self):
+		try:
+			# `name` is the motiongraph name, NOT the clip filter - the clip filter
+			# is applied below, the way ovl_tool_cmd's --match does.
+			rows = list_choosers(self.source_path(),
+								 self.name_edit.text().strip() or None, DEFAULT_GAME)
+		except Exception as exc:
+			self.showerror(str(exc))
+			return
+		self.chooser_tree.clear()
+		match = self.chooser_filter.text().strip().lower()
+		shown = 0
+		for row in rows:
+			clips = row.get("clips", [])
+			if match and not any(match in str(c.get("name", "")).lower() for c in clips):
+				continue
+			shown += 1
+			address = f"{row['pool']}:{row['offset']}"
+			total = sum(int(c.get("weight", 0)) for c in clips) or 1
+			parent = QtWidgets.QTreeWidgetItem([
+				f"chooser {address}", "", "",
+				f"{len(clips)} clips  blend {row.get('blend_time', 0.0):.2f}  "
+				f"flags {row.get('flags', '?')}"
+				+ ("  (flags 8 ignores blend_time)" if row.get("flags") == 8 else "")])
+			parent.setData(0, QtCore.Qt.UserRole, (row["pool"], row["offset"],
+												   [int(c.get("weight", 0)) for c in clips]))
+			for clip in clips:
+				w = int(clip.get("weight", 0))
+				parent.addChild(QtWidgets.QTreeWidgetItem(
+					[str(clip.get("name", "?")), str(w), f"{100.0 * w / total:.1f}%", ""]))
+			self.chooser_tree.addTopLevelItem(parent)
+			parent.setExpanded(True)
+		self.status_bar.showMessage(f"Listed {shown} chooser(s)", 8000)
+		if not shown:
+			logging.info("No choosers matched that filter")
+
+	def chooser_selected(self):
+		items = self.chooser_tree.selectedItems()
+		if not items:
+			return
+		item = items[0]
+		if item.parent() is not None:
+			item = item.parent()
+		data = item.data(0, QtCore.Qt.UserRole)
+		if not data:
+			return
+		pool, offset, weights = data
+		self.chooser_target.setText(f"chooser {pool}:{offset}")
+		self.chooser_weights.setText(",".join(str(w) for w in weights))
+
+	def _selected_chooser(self):
+		items = self.chooser_tree.selectedItems()
+		if not items:
+			raise ValueError("Select a chooser in the list first")
+		item = items[0]
+		if item.parent() is not None:
+			item = item.parent()
+		data = item.data(0, QtCore.Qt.UserRole)
+		if not data:
+			raise ValueError("Select a chooser row, not a clip row")
+		return data[0], data[1]
+
+	def apply_chooser_weights(self):
+		try:
+			pool, offset = self._selected_chooser()
+			weights = [int(x) for x in self.chooser_weights.text().split(",") if x.strip()]
+			if not weights:
+				raise ValueError("Enter one weight per clip, comma separated")
+			row = set_chooser_weights(self.source_path(), self.output_path(), pool, offset,
+									  weights, name=self.name_edit.text().strip() or None,
+									  game=DEFAULT_GAME)
+			total = sum(weights) or 1
+			shares = "  ".join(f"{100.0 * w / total:.1f}%" for w in weights)
+			self.status_bar.showMessage(f"Weights applied - shares {shares}", 12000)
+			logging.info(f"Chooser {pool}:{offset} weights -> {weights} ({shares})")
+			# A weight edit is fixed-width inside an existing slot.
+			self.census_guard("chooser re-weight", expect_added=0, expect_removed=0)
+		except Exception as exc:
+			self.showerror(str(exc))
+
+	def apply_chooser_add(self):
+		try:
+			pool, offset = self._selected_chooser()
+			clip = self.chooser_add_clip.text().strip()
+			if not clip:
+				raise ValueError("Enter the full clip name to add, e.g. Species$Rest03")
+			report = grow_random_animation_chooser(
+				self.source_path(), self.output_path(), pool, offset, clip,
+				weight=self.chooser_add_weight.value(),
+				name=self.name_edit.text().strip() or None, game=DEFAULT_GAME)
+			self.status_bar.showMessage(f"Added '{clip}' to chooser {pool}:{offset}", 12000)
+			logging.info(f"Chooser {pool}:{offset} grown with '{clip}': {report}")
+			# Growth relocates the entry array and may append a string; the object
+			# count should rise, and nothing may disappear.
+			self.census_guard("chooser growth", expect_added=None, expect_removed=0)
+			self.showerror(
+				"Chooser growth is TOPOLOGY GROWTH, and cobra reload is not proof of "
+				"engine acceptance. Every operation of this class has needed a game "
+				"launch to verify. Check the census line in the log, then test in game."
+			)
+		except Exception as exc:
+			self.showerror(str(exc))
+
+	# ---- Capacity -------------------------------------------------------
+
+	def run_capacity_audit(self):
+		if self.loader is None:
+			self.showerror("Load a source OVL first")
+			return
+		try:
+			audit = build_capacity_audit(self.loader, self.source_path())
+			self.capacity_text.setPlainText(render_capacity_markdown(audit))
+			self.status_bar.showMessage("Capacity audit complete", 8000)
+		except Exception as exc:
+			self.showerror(str(exc))
+
+	# ---- Rename repair --------------------------------------------------
+
+	def _rename_tokens(self):
+		old = self.rename_old.text().strip()
+		new = self.rename_new.text().strip()
+		if not old or not new:
+			raise ValueError("Enter both the old and the current species token")
+		return old, new
+
+	def run_rename_survey(self):
+		try:
+			old, new = self._rename_tokens()
+			repointable, missing = survey_stale_references(
+				self.source_path(), old, new, DEFAULT_GAME)
+			total = sum(n for _o, _n, n in repointable)
+			lines = [f"{total} repointable fragment(s) across {len(repointable)} name(s)", ""]
+			for o, n, count in repointable:
+				lines.append(f"  {count:4d}  {o}  ->  {n}")
+			lines.append("")
+			lines.append(f"UNREPAIRABLE - no renamed counterpart exists: {len(missing)}")
+			for m in missing:
+				lines.append(f"        {m}")
+			if missing:
+				lines.append("")
+				lines.append("A name with no counterpart is dead under BOTH names. Repointing it "
+							 "would be inventing a target; it is left alone.")
+			self.rename_text.setPlainText("\n".join(lines))
+			self.status_bar.showMessage(
+				f"{total} repointable, {len(missing)} unrepairable", 10000)
+		except Exception as exc:
+			self.showerror(str(exc))
+
+	def apply_rename_repair(self):
+		try:
+			old, new = self._rename_tokens()
+			report = repoint_stale_species_strings(
+				self.source_path(), self.output_path(), old, new, DEFAULT_GAME)
+			self.rename_text.setPlainText(
+				f"Repointed {report.repointed} fragment(s) across "
+				f"{len(report.distinct_names)} name(s).\n\n"
+				+ "\n".join(f"  {n}" for n in report.distinct_names)
+				+ (f"\n\nLeft alone (no counterpart): {', '.join(report.missing)}"
+				   if report.missing else ""))
+			self.status_bar.showMessage(
+				f"Repointed {report.repointed} stale references", 12000)
+			logging.info(
+				f"Rename repair: {report.repointed} fragments, "
+				f"{len(report.distinct_names)} names, missing={report.missing}")
+			# A pure fragment repoint must not change the decoded object set.
+			self.census_guard("rename repair", expect_added=0, expect_removed=0)
 		except Exception as exc:
 			self.showerror(str(exc))
 

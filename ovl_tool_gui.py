@@ -29,6 +29,7 @@ from gui.widgets import window, MenuItem, SubMenuItem, SeparatorMenuItem
 from modules import walker
 import modules.formats.shared
 from generated.formats.ovl import games, OvlFile
+from source.formats.ovl.species_rename import CHECKLIST, rename_family, summary_text
 from generated.formats.ovl_base.enums.Compression import Compression
 from PyQt5 import QtWidgets, QtGui, QtCore
 from typing import Optional
@@ -178,6 +179,7 @@ class MainWindow(window.MainWindow):
 				MenuItem("Rename Files", self.rename, shortcut="CTRL+R", icon="rename"),
 				MenuItem("Rename Contents", self.rename_contents, shortcut="CTRL+SHIFT+R", icon="rename_contents"),
 				MenuItem("Rename Both", self.rename_both, shortcut="CTRL+ALT+R"),
+				MenuItem("Rename Species Family...", self.rename_species_family, icon="rename", tooltip="Copy a species OVL family and rename it properly - internals, .ovs companions and the DERIVED .aux name"),
 				SeparatorMenuItem(),
 				MenuItem("Load Included OVL List", self.load_included_ovls),
 				MenuItem("Export Included OVL List", self.save_included_ovls),
@@ -630,6 +632,77 @@ class MainWindow(window.MainWindow):
 	def rename_both(self):
 		self.rename_contents()
 		self.rename()
+
+	def rename_species_family(self):
+		"""Copy a species OVL family to a new folder under a new token.
+
+		The plain Rename Files / Rename Contents actions do two of the four jobs a
+		species needs. They do NOT move the .ovs companions and they do NOT recompute
+		the .aux filename, which is DERIVED from the archive basename - so the archive
+		saves happily and then dies on load in get_aux_data with KeyError: ''.
+
+		This runs the whole thing on disk, leaves the source untouched, and shows the
+		checklist of what it deliberately cannot do (the second donor token, the
+		prefab's AssetPackages inheritance, and the FDB override columns).
+		"""
+		source = QtWidgets.QFileDialog.getOpenFileName(
+			self, "Select the species OVL to copy and rename",
+			self.cfg.get("dir_ovls_in", "C://"), "OVL files (*.ovl)")[0]
+		if not source:
+			return
+
+		dialog = QtWidgets.QDialog(self)
+		dialog.setWindowTitle("Rename Species Family")
+		form = QtWidgets.QFormLayout(dialog)
+		out_dir = QtWidgets.QLineEdit()
+		browse = QtWidgets.QPushButton("Browse...")
+
+		def pick_dir():
+			chosen = QtWidgets.QFileDialog.getExistingDirectory(
+				dialog, "Output folder (must NOT be the source folder)")
+			if chosen:
+				out_dir.setText(chosen)
+
+		browse.clicked.connect(pick_dir)
+		row = QtWidgets.QHBoxLayout()
+		row.addWidget(out_dir)
+		row.addWidget(browse)
+		old_token = QtWidgets.QLineEdit()
+		old_token.setPlaceholderText("deinosuchus")
+		new_token = QtWidgets.QLineEdit()
+		new_token.setPlaceholderText("viralsarcosuchus  (any length - equal width is NOT required)")
+		stem = QtWidgets.QLineEdit()
+		stem.setPlaceholderText("optional, e.g. SarcoViral_Female - keeps the archive filename")
+		form.addRow("Output folder", row)
+		form.addRow("From token", old_token)
+		form.addRow("To token", new_token)
+		form.addRow("Output stem", stem)
+		buttons = QtWidgets.QDialogButtonBox(
+			QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+		buttons.accepted.connect(dialog.accept)
+		buttons.rejected.connect(dialog.reject)
+		form.addRow(buttons)
+		if dialog.exec_() != QtWidgets.QDialog.Accepted:
+			return
+
+		if not out_dir.text() or not old_token.text() or not new_token.text():
+			self.showwarning("Output folder, from token and to token are all required")
+			return
+		try:
+			report = rename_family(
+				source, out_dir.text(), old_token.text().strip(),
+				new_token.text().strip(), stem.text().strip() or None,
+				game=self.ovl_data.game if self.is_open_ovl() else "Jurassic World Evolution 3")
+		except Exception:
+			self.handle_error("Species rename failed, see log!")
+			return
+		logging.success(summary_text(report))
+		logging.warning("Verify the output before deploying; never work in the live install")
+		box = QtWidgets.QMessageBox(self)
+		box.setWindowTitle("Species renamed")
+		box.setText(summary_text(report))
+		box.setDetailedText(CHECKLIST)
+		box.exec_()
 
 	def save_file_list(self):
 		"""Save the OVL file list to disk"""

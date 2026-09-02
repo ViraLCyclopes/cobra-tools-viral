@@ -5,6 +5,7 @@ import time
 
 import bpy
 import mathutils
+from bpy_extras import anim_utils
 import numpy as np
 
 from generated.formats.manis import ManisFile
@@ -64,8 +65,14 @@ def key_unanimated_channels(b_ob, action):
 		"rotation_quaternion": (1.0, 0.0, 0.0, 0.0),
 		"scale": (1.0, 1.0, 1.0),
 	}
+	# Blender 5.0 moved fcurves out of `action.fcurves` and into a channelbag per
+	# action slot. The legacy collection still EXISTS there but is empty, so reading
+	# it silently reports "nothing is keyed" and this function then pads every
+	# channel on every bone - and writing to it raises on `action_group`.
+	fcurves = action_fcurves(action)
+
 	keyed = {}
-	for fcu in action.fcurves:
+	for fcu in fcurves:
 		if '"' not in fcu.data_path:
 			continue
 		bone_name = fcu.data_path.split('"')[1]
@@ -80,11 +87,35 @@ def key_unanimated_channels(b_ob, action):
 			data_path = f'pose.bones["{p_bone.name}"].{channel}'
 			for i, value in enumerate(values):
 				try:
-					fcu = action.fcurves.new(data_path, index=i, action_group=p_bone.name)
+					fcu = new_fcurve(action, data_path, i, p_bone.name)
 				except RuntimeError:
 					# already exists for this index, nothing to pad
 					continue
 				fcu.keyframe_points.insert(frame, value)
+
+
+
+def action_fcurves(action):
+	"""The action's fcurve collection, on both the legacy and slotted APIs.
+
+	Blender 5.0 keeps `action.fcurves` for compatibility but leaves it EMPTY -
+	the real curves live in a channelbag belonging to an action slot.
+	"""
+	if bpy.app.version >= (5, 0, 0) and len(action.slots):
+		return anim_utils.action_ensure_channelbag_for_slot(action, action.slots[0]).fcurves
+	return action.fcurves
+
+
+def new_fcurve(action, data_path, index, group_name):
+	"""Create one fcurve, on both APIs.
+
+	The slotted API renamed the keyword `action_group` -> `group_name` and moved
+	`new()` -> `ensure()`.
+	"""
+	if bpy.app.version >= (5, 0, 0) and len(action.slots):
+		channelbag = anim_utils.action_ensure_channelbag_for_slot(action, action.slots[0])
+		return channelbag.fcurves.ensure(data_path=data_path, index=index, group_name=group_name)
+	return action.fcurves.new(data_path, index=index, action_group=group_name)
 
 
 def get_channel(m_bone_names, m_keys, b_local_inv_mats, b_action, b_dtype):

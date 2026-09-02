@@ -83,6 +83,44 @@ def _find_before(data: bytes, size: int, want_hash: int, search_end: int):
 	return None
 
 
+def check_name_buffer(path: str):
+	"""Return (ok, message) for the name buffer's hash/name pairing.
+
+	Buffer1 stores `n` djb2 hashes followed by `n` ZStrings, and its own docstring
+	records the consequence of getting that wrong: "the game verifies that hash and
+	target name match; if they don't, the target won't be animated."
+
+	Worth checking after every rebuild because NOTHING else notices. Splicing a
+	resized compressed_database over only its declared size - rather than its padded
+	extent - orphans 8 bytes of padding, the reader takes them as two extra zero
+	hashes, and every name then pairs with the hash two positions along. Gates A, B,
+	C and F all passed on exactly that file; the only visible symptom was
+	target_names[0] coming back as '<8 junk bytes>def_l_rearLegUpr_joint', so that
+	one bone matched nothing and could not be imported or animated.
+
+	Shipped bundles pair at offset 0 with no exceptions (164/164 on Acrocanthosaurus
+	motionextracted.maniset3c751329), which is what makes this a usable invariant
+	rather than a heuristic.
+	"""
+	from generated.formats.manis import ManisFile
+	from modules.formats.shared import djb2
+
+	manis = ManisFile()
+	manis.game = "Jurassic World Evolution 3"
+	manis.load(path)
+	hashes = [int(h) for h in manis.name_buffer.target_hashes]
+	names = [str(n) for n in manis.name_buffer.target_names]
+	if not names:
+		return True, "no name buffer in this bundle (nothing to check)"
+	if len(hashes) != len(names):
+		return False, f"{len(hashes)} hashes for {len(names)} names"
+	bad = [i for i, name in enumerate(names) if hashes[i] != djb2(name.lower())]
+	if bad:
+		return False, (f"{len(bad)} of {len(names)} names do not match their hash "
+					   f"(first at index {bad[0]}: {names[bad[0]]!r})")
+	return True, f"{len(names)}/{len(names)} names match their hash"
+
+
 def locate_bulk(data: bytes):
 	"""Return {'medium_offset', 'low_offset'} verified by hash, or None."""
 	info = read_bulk_info(data)

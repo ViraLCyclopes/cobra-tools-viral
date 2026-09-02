@@ -29,6 +29,7 @@ Blocks are aligned to 16 relative to the start of the keys buffer.
 
 Then inject with --update.
 """
+import logging
 import argparse
 import math
 import os

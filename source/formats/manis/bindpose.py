@@ -65,6 +65,27 @@ def read_ms2_bind(ms2_path: str, model_index: int = 0):
     return parents, values
 
 
+def read_ms2_bone_names(ms2_path: str, model_index: int = 0):
+    """Return the skeleton's bone names, in track order.
+
+    `Ms2File.load()` resolves `bone.name` from the file's name pool, so this is the
+    same order the ACL track indices use. Returns an empty list rather than raising
+    if the names did not resolve - a caller that only wants to look one up can fall
+    back to numeric indices.
+    """
+    from generated.formats.ms2 import Ms2File
+
+    ms2 = Ms2File()
+    ms2.load(ms2_path)
+    bone_info = ms2.model_infos[model_index].bone_info
+    if bone_info is None:
+        return []
+    try:
+        return [str(bone.name) for bone in bone_info.bones]
+    except AttributeError:
+        return []
+
+
 def bind_bytes(parents: np.ndarray, values: np.ndarray) -> bytes:
     """Serialise a bind pose into the .jbind blob jwe3_acl_encode.exe reads."""
     count = len(parents)
@@ -125,7 +146,7 @@ def bind_for_manis(ms2_path: str, num_tracks: int, model_index: int = 0):
 SUB_TRACKS = ((0, 4), (4, 7), (7, 10))
 
 
-def clip_defaults(values, bind):
+def clip_defaults(values, bind, keep_all=False):
 	"""Per-clip ACL defaults that reproduce a vanilla clip's stripped set exactly.
 
 	ACL strips a sub-track when every sample equals `track_desc::default_value`, and
@@ -161,7 +182,14 @@ def clip_defaults(values, bind):
 		block = values[:, :, lo:hi]
 		missing = np.isnan(block)
 		stripped = missing.all(axis=0).all(axis=-1)
-		kept = ~stripped
+		# keep_all forces EVERY sub-track to be stored, so every bone becomes
+		# editable from Blender. Storing more than vanilla is a superset: the
+		# runtime reads an explicit value instead of substituting the bind it
+		# would otherwise supply, so an unedited clip is unchanged. (Stripping
+		# MORE than vanilla is the dangerous direction - that is what made
+		# animals crush and stretch.) Costs blob size; verify in game before
+		# relying on it.
+		kept = np.ones_like(stripped) if keep_all else ~stripped
 		if not kept.any():
 			continue
 		held = np.nan_to_num(np.nanmax(block, axis=0), nan=0.0)

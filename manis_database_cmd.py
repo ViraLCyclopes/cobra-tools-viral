@@ -20,6 +20,7 @@ the game rejects the result.
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -28,8 +29,10 @@ import numpy as np
 
 from generated.formats.manis.acl import decode_file, encode_tracks, decode_blob, _write_jacl
 from source.formats.manis.bindpose import (
-	bind_bytes, clip_defaults, extend_bind_pose, read_ms2_bind, write_jbind)
-from source.formats.manis.database import find_database, read_bulk_info, locate_bulk
+	bind_bytes, clip_defaults, extend_bind_pose, read_ms2_bind, read_ms2_bone_names,
+	write_jbind)
+from source.formats.manis.database import (
+	check_name_buffer, find_database, read_bulk_info, locate_bulk)
 from source.formats.manis.limbs import block_layout, buffer_residue, rebuild_block
 from source.formats.manis.selfcontained import count_parsed_maniblocks
 from source.formats.manis.splice import list_clip_blobs, read_blob_header
@@ -53,7 +56,8 @@ def pad_to(data, alignment=BULK_ALIGNMENT):
 
 
 def build_database(streams, headers, bind, work_dir, parents, bind_values,
-				   precision=None, medium_proportion=None, low_proportion=None):
+				   precision=None, medium_proportion=None, low_proportion=None,
+				   dense=()):
 	"""Run the ACL database builder over every transform clip.
 
 	Returns (bound_blobs_by_stream_index, database_bytes, low_bulk, medium_bulk).
@@ -74,7 +78,7 @@ def build_database(streams, headers, bind, work_dir, parents, bind_values,
 		tracks = stream.values.shape[1]
 		clip_parents = parents[:tracks]
 		write_jbind(clip_bind, clip_parents,
-					clip_defaults(stream.values, bind_values))
+					clip_defaults(stream.values, bind_values, keep_all=index in dense))
 		manifest_lines.append(
 			f"{jacl}|{1 if headers[index]['wrap_optimized'] else 0}|{clip_bind}")
 		order.append(index)
@@ -324,7 +328,25 @@ def read_jacl(path):
 	return values.reshape(samples, tracks, comps).copy(), track_type, rate
 
 
-def replace_clip_samples(manis_path, streams, headers, clip_name, jacl_path):
+def resolve_tracks(spec, bone_names):
+	"""Turn a comma-separated list of bone names and/or track indices into indices."""
+	out = []
+	for token in spec.split(","):
+		token = token.strip()
+		if not token:
+			continue
+		if token.lstrip("-").isdigit():
+			out.append(int(token))
+			continue
+		if token not in bone_names:
+			sys.exit(f"--hold-track: no bone named '{token}'. The skeleton has "
+					 f"{len(bone_names)} bones.")
+		out.append(bone_names.index(token))
+	return sorted(set(out))
+
+
+def replace_clip_samples(manis_path, streams, headers, clip_name, jacl_path,
+						 hold=()):
 	"""Swap one clip's animation for samples authored outside the game.
 
 	This is the Blender export path. The bundle is NOT rebuilt from scratch -
@@ -351,6 +373,7 @@ def replace_clip_samples(manis_path, streams, headers, clip_name, jacl_path):
 	index = transforms[order]
 
 	values, track_type, rate = read_jacl(jacl_path)
+	wrap = headers[index]["wrap_optimized"]
 	if track_type != QVVF:
 		sys.exit(f"{jacl_path} holds track type {track_type}, expected {QVVF} (qvvf)")
 	have = streams[index].values.shape[1]
@@ -359,6 +382,19 @@ def replace_clip_samples(manis_path, streams, headers, clip_name, jacl_path):
 				 f"{values.shape[1]}. The channel list is fixed by the resident "
 				 f"ManiBlock; export against this clip's own skeleton.")
 	before = streams[index].values.shape[0]
+
+	# A wrap-optimised clip's final frame is IMPLICIT and equal to its first, so it
+	# declares one more frame than it stores. Blender imports frame_count keys, so an
+	# export of such a clip comes back with exactly one sample too many. Drop it here
+	# rather than let it read as a retime and silently lengthen the clip. Only the
+	# exact off-by-one is treated this way; any other change is a real retime.
+	if wrap and values.shape[0] == before + 1:
+		head, tail = values[0], values[-1]
+		finite = np.isfinite(head) & np.isfinite(tail)
+		drift = float(np.abs(head[finite] - tail[finite]).max()) if finite.any() else 0.0
+		values = values[:-1]
+		print(f"           wrap-optimised: dropped the implicit last frame "
+			  f"(it differs from the first by {drift:.4f})")
 
 	# Blender has no concept of a stripped sub-track: every bone always has a pose,
 	# so a .jacl exported from it is fully dense. Storing all of that would change
@@ -381,8 +417,48 @@ def replace_clip_samples(manis_path, streams, headers, clip_name, jacl_path):
 	if dropped:
 		print(f"           {dropped} components discarded to preserve the vanilla "
 			  f"stripped set ({mask.mean():.1%} of the clip is game-supplied)")
+
+	# The exporter writes NaN for a bone it could not author - one whose Blender
+	# fcurves hold a single identity key because the rig reproduces it through a
+	# constraint rather than through keys. Taking those samples would overwrite a
+	# real curve with a frozen identity pose, which is what happened to
+	# def_rearLegUpr_joint.L: vanilla stores that track, so the stripped-set mask
+	# above does NOT catch it. Fall back to the template wherever the export
+	# declined to speak, but only where the template has something to say.
+	unauthored = np.isnan(incoming) & ~mask
+	if unauthored.any():
+		incoming = np.where(unauthored, template if incoming.shape[0] == template.shape[0]
+							else template[np.rint(np.linspace(
+								0, template.shape[0] - 1, incoming.shape[0])).astype(int)],
+							incoming)
+		bones = int(np.unique(np.where(unauthored)[1]).size)
+		print(f"           {bones} bone(s) not authored in Blender kept their "
+			  f"template animation")
+	# Some bones cannot survive a Blender round trip. `srb` and the LOD nodes
+	# (Deinosuchus_Female_L0..L5 and their equivalents) are PARENTLESS bones whose
+	# imported rest matrix already carries the ManisCorrector's -90 degrees about X,
+	# where def_c_root_joint - also parentless - sits at identity. Exporting them
+	# applies the correction a second time, so they come back a constant 90 degrees
+	# out on every frame. Vanilla leaves all of them stripped; they only became
+	# writable at all because --dense-clip un-strips everything, and srb is the
+	# motion-extraction node, so authoring it from a pose is never intended.
+	# Holding them at the template is therefore the correct answer, not a patch over
+	# an exporter bug: 42 of the 49 identity-rotation bones round-trip cleanly and
+	# only these seven do not.
+	for track in hold:
+		if not 0 <= track < template.shape[1]:
+			sys.exit(f"--hold-track: track {track} is out of range "
+					 f"(clip has {template.shape[1]})")
+		if incoming.shape[0] == template.shape[0]:
+			incoming[:, track] = template[:, track]
+		else:
+			src = np.rint(np.linspace(0, template.shape[0] - 1,
+									  incoming.shape[0])).astype(int)
+			incoming[:, track] = template[src, track]
+	if hold:
+		print(f"           held {len(hold)} track(s) at the template: "
+			  f"{', '.join(str(t) for t in hold)}")
 	streams[index].values = incoming
-	wrap = headers[index]["wrap_optimized"]
 	samples = values.shape[0]
 	frame_count = samples + 1 if wrap else samples
 	duration = (samples if wrap else samples - 1) / streams[index].sample_rate
@@ -439,6 +515,39 @@ def main():
 					help="clip NAME whose samples to replace from --jacl (Blender export)")
 	ap.add_argument("--jacl", type=str,
 					help="JACL sample file to read for --replace-clip")
+	ap.add_argument("--hold-track", type=str, default="srb",
+					help="comma-separated bone names or track indices to keep at the "
+						 "template's values instead of taking them from --jacl. "
+						 "Defaults to 'srb'; the LOD nodes are added automatically. "
+						 "Pass an empty string to hold nothing.")
+	ap.add_argument("--dense-clip", type=str,
+					help="clip NAME to store in full - every sub-track kept, so every "
+						 "bone becomes editable from Blender instead of only the ones "
+						 "vanilla animated. Bigger, and unverified in game.")
+	ap.add_argument("--store-sub", action="append", default=[], metavar="CLIP:BONE:GROUP",
+					help="store ONE sub-track vanilla stripped, keeping the vanilla "
+						 "stripped set everywhere else. GROUP is ori, pos or scl. "
+						 "Repeatable. This is the one-bone-at-a-time version of "
+						 "--dense-clip, which flips all 1,700 components at once: a "
+						 "whole-clip failure says nothing about whether an individual "
+						 "bone is safe, which is why the crush/stretch result does not "
+						 "settle the stripped-set contract. "
+						 "e.g. 'species$rest03:def_c_jaw_joint:pos'")
+	ap.add_argument("--store-animate", action="store_true",
+					help="make --store-offset sweep over the clip (0 -> full -> 0) "
+						 "instead of holding a constant. ACL classifies a sub-track as "
+						 "default, constant or ANIMATED, and an added constant may be "
+						 "treated differently from an added animated track - three "
+						 "added constants on three unrelated bones were all ignored in "
+						 "game, which is what makes this the variable left to test.")
+	ap.add_argument("--store-offset", type=str, default="",
+					help="comma-separated offset added to the bind value --store-sub "
+						 "writes, e.g. '0,-1.5,0'. Storing the plain bind is a POSITIVE "
+						 "CONTROL PROBLEM: if the runtime substitutes the same bind for "
+						 "a stripped sub-track, storing it explicitly is invisible, and "
+						 "'looks normal' cannot distinguish 'the game read our value' "
+						 "from 'the game ignored it'. An offset the eye cannot miss "
+						 "makes the run interpretable in both directions.")
 	args = ap.parse_args()
 
 	with open(args.manis, "rb") as fh:
@@ -476,12 +585,156 @@ def main():
 		streams = scale_motion_track(args.manis, streams, headers,
 									 args.motion_clip, args.motion_factor)
 
+	dense_indices = set()
+	if args.dense_clip:
+		from generated.formats.manis import ManisFile as _MF
+		_m = _MF(); _m.game = "Jurassic World Evolution 3"; _m.load(args.manis)
+		_names = [str(i.name) for i in _m.mani_infos]
+		if args.dense_clip not in _names:
+			sys.exit(f"no clip named '{args.dense_clip}'")
+		_tf = [i for i, h in enumerate(headers) if h["track_type"] == QVVF]
+		_i = _tf[_names.index(args.dense_clip)]
+		dense_indices = {_i}
+		# A stripped sub-track has no samples - it is all NaN, and the encoder fills
+		# NaN with the default, so it would be constant-equal-to-default and get
+		# stripped straight back. To store it we must give it real samples, and the
+		# only honest value is the bind pose: exactly what the game would have
+		# supplied. The clip is then unchanged to look at, but every bone is present
+		# and can be edited.
+		_v = streams[_i].values
+		_n = _v.shape[1]
+		_fill = np.broadcast_to(bind_values[None, :_n, :], _v.shape)
+		_was = int(np.isnan(_v).all(axis=0).all(axis=-1).sum())
+		streams[_i].values = np.where(np.isnan(_v), _fill, _v)
+		_now = int(np.isnan(streams[_i].values).all(axis=0).all(axis=-1).sum())
+		print(f"  dense: '{args.dense_clip}' filled from the bind pose - "
+			  f"fully stripped bones {_was} -> {_now}, every sub-track will be stored")
+
+	if args.store_sub:
+		# Same mechanism as --dense-clip but scoped to one (clip, bone, group).
+		# Filling the samples is both necessary AND sufficient: once a sub-track
+		# holds real values it is no longer all-NaN, so clip_defaults sees it as
+		# "vanilla stored this", moves the default away from it, and ACL keeps it.
+		# No change to clip_defaults is needed, and every other sub-track in the
+		# bundle keeps the vanilla stripped set by construction.
+		from generated.formats.manis import ManisFile as _MF2
+		_m2 = _MF2(); _m2.game = "Jurassic World Evolution 3"; _m2.load(args.manis)
+		_names2 = [str(i.name) for i in _m2.mani_infos]
+		_tf2 = [i for i, h in enumerate(headers) if h["track_type"] == QVVF]
+		_bones = read_ms2_bone_names(args.ms2)
+		_groups = {"ori": (0, 4), "pos": (4, 7), "scl": (7, 10)}
+		for spec in args.store_sub:
+			parts = spec.split(":")
+			if len(parts) != 3:
+				sys.exit(f"--store-sub wants CLIP:BONE:GROUP, got '{spec}'")
+			clip_name, bone_name, group = parts[0], parts[1], parts[2].lower()
+			if group not in _groups:
+				sys.exit(f"--store-sub group must be ori, pos or scl, got '{group}'")
+			if clip_name not in _names2:
+				sys.exit(f"--store-sub: no clip named '{clip_name}'")
+			si = _tf2[_names2.index(clip_name)]
+			lo, hi = _groups[group]
+			v = streams[si].values
+			if bone_name == "*":
+				# Every sub-track vanilla stripped in this group. A shotgun: it loses
+				# per-bone attribution but answers "is ANY added sub-track ever read?"
+				# without having to guess which bone is visible from the camera.
+				tracks = [t for t in range(v.shape[1])
+						  if np.isnan(v[:, t, lo:hi]).all()]
+				print(f"  store-sub: '*' matched {len(tracks)} stripped {group} "
+					  f"sub-tracks in {clip_name}")
+			elif bone_name.lstrip("-").isdigit():
+				tracks = [int(bone_name)]
+			elif bone_name in _bones:
+				tracks = [_bones.index(bone_name)]
+			else:
+				sys.exit(f"--store-sub: no bone named '{bone_name}' in the {len(_bones)} "
+						 f"bone skeleton")
+			for track in tracks:
+				if track >= v.shape[1]:
+					sys.exit(f"--store-sub: track {track} is past this clip's "
+							 f"{v.shape[1]} tracks")
+				if not np.isnan(v[:, track, lo:hi]).all():
+					sys.exit(f"--store-sub: {clip_name} {bone_name} {group} is ALREADY "
+							 f"stored by vanilla - forcing it would change nothing and "
+							 f"the test would read a no-op as a pass. Pick a sub-track "
+							 f"that is actually stripped.")
+				value = np.array(bind_values[track, lo:hi], dtype="<f4", copy=True)
+				if args.store_offset:
+					delta = [float(x) for x in args.store_offset.split(",") if x.strip()]
+					if group == "ori":
+						# For a rotation the offset is euler XYZ DEGREES composed onto
+						# the bind quaternion - adding to quaternion components would
+						# leave the unit sphere and mean nothing.
+						if len(delta) != 3:
+							sys.exit("--store-offset for group 'ori' wants 3 euler "
+									 f"degrees, got {len(delta)}")
+						rx, ry, rz = (np.radians(d) / 2.0 for d in delta)
+						cx, sx, cy, sy, cz, sz = (np.cos(rx), np.sin(rx), np.cos(ry),
+												  np.sin(ry), np.cos(rz), np.sin(rz))
+						q = np.array([sx * cy * cz - cx * sy * sz,
+									  cx * sy * cz + sx * cy * sz,
+									  cx * cy * sz - sx * sy * cz,
+									  cx * cy * cz + sx * sy * sz], dtype="<f8")
+						x1, y1, z1, w1 = q
+						x2, y2, z2, w2 = value.astype("<f8")
+						value = np.array([
+							w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+							w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+							w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+							w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2], dtype="<f8")
+						value = (value / np.linalg.norm(value)).astype("<f4")
+					else:
+						if len(delta) != hi - lo:
+							sys.exit(f"--store-offset needs {hi - lo} numbers for group "
+									 f"'{group}', got {len(delta)}")
+						value = value + np.array(delta, dtype="<f4")
+				if args.store_animate and args.store_offset:
+					# Sweep bind -> full offset -> bind across the clip so ACL cannot
+					# collapse the sub-track to a constant.
+					n = v.shape[0]
+					w = np.sin(np.linspace(0.0, np.pi, n)).astype("<f8")
+					base = bind_values[track, lo:hi].astype("<f8")
+					if group == "ori":
+						tgt = value.astype("<f8")
+						if float(base @ tgt) < 0.0:
+							tgt = -tgt
+						th = np.arccos(np.clip(float(base @ tgt), -1.0, 1.0))
+						if th < 1e-6:
+							frames = np.broadcast_to(base, (n, 4)).copy()
+						else:
+							frames = ((np.sin((1 - w)[:, None] * th) * base
+									   + np.sin(w[:, None] * th) * tgt) / np.sin(th))
+						frames = frames / np.linalg.norm(frames, axis=1, keepdims=True)
+					else:
+						frames = base + w[:, None] * (value.astype("<f8") - base)
+					v[:, track, lo:hi] = frames.astype("<f4")
+					mode = "ANIMATED bind -> offset -> bind"
+				else:
+					v[:, track, lo:hi] = value
+					mode = "constant"
+				if len(tracks) <= 4:
+					label = _bones[track] if track < len(_bones) else str(track)
+					print(f"  store-sub: {clip_name} track {track} ({label}) {group} "
+						  f"{mode} - now STORED")
+			if len(tracks) > 4:
+				print(f"  store-sub: {clip_name} {group} - {len(tracks)} sub-tracks "
+					  f"now STORED ({'animated' if args.store_animate else 'constant'})")
+
 	resampled = None
 	if args.replace_clip:
 		if not args.jacl:
 			sys.exit("--replace-clip needs --jacl")
+		bone_names = read_ms2_bone_names(args.ms2)
+		hold = resolve_tracks(args.hold_track or "", bone_names)
+		# The LOD nodes share srb's parentless, pre-rotated rest matrix and break the
+		# same way, but their names carry the species, so match on shape rather than
+		# making every caller spell out six bones.
+		hold += [i for i, n in enumerate(bone_names)
+				 if re.fullmatch(r".+_L\d+", n) and i not in hold]
+		hold = sorted(set(hold))
 		streams, resampled, new_duration = replace_clip_samples(
-			args.manis, streams, headers, args.replace_clip, args.jacl)
+			args.manis, streams, headers, args.replace_clip, args.jacl, hold)
 
 	if args.resample_clip:
 		streams, resampled, new_duration = resample_clip(
@@ -491,7 +744,8 @@ def main():
 		bound, database, low, medium = build_database(
 			streams, headers, bind, work_dir, parents, bind_values,
 			precision=args.precision,
-			medium_proportion=args.medium, low_proportion=args.low)
+			medium_proportion=args.medium, low_proportion=args.low,
+			dense=dense_indices)
 
 	# Work on the keys region alone and append the bulk once it is settled, so
 	# nothing below can shift the bulk out from under locate_bulk().
@@ -532,9 +786,26 @@ def main():
 		with_limbs += bool(block["limb"])
 	print(f"  rebuilt {len(blocks)} ManiBlocks, {with_limbs} carrying limb data")
 
-	# the database sits at the tail of buffer 0, immediately after the ManiInfo array
+	# The database sits at the tail of buffer 0, immediately after the ManiInfo array.
+	#
+	# Replace its PADDED extent, not its declared size. CompressedHeaderReader consumes
+	# `size + (-size % 16)` - the blob plus the padding up to 16 that belongs to buffer 0
+	# - so the region the reader treats as "the database" is the padded one. Splicing a
+	# new blob over only `db_size` bytes leaves the old padding behind: appending a clip
+	# grows the database by ~8 bytes per clip (312 -> 320 for Deinosuchus 29 -> 30), the
+	# reader consumes 320, lands on the 8 orphaned padding bytes, and parses them as two
+	# extra zero entries at the head of the name buffer's hash array.
+	#
+	# Everything then shifts by two: target_names[0] swallows the last two hashes and
+	# comes out as '<8 junk bytes>def_l_rearLegUpr_joint', so that bone's name matches
+	# nothing. Buffer1's own docstring - "the game verifies that hash and target name
+	# match; if they don't, the target won't be animated" - makes that a live bug, not
+	# just a parsing nuisance. Shipped bundles pair 164/164 at offset 0; the bundle this
+	# tool produced paired 0/163 until this fix.
 	db_offset, db_size = find_database(keys)
-	keys = keys[:db_offset] + database + keys[db_offset + db_size:]
+	old_extent = db_size + (-db_size % BULK_ALIGNMENT)
+	new_database = pad_to(database)
+	keys = keys[:db_offset] + new_database + keys[db_offset + old_extent:]
 
 	data = keys + pad_to(low) + pad_to(medium)
 
@@ -553,6 +824,11 @@ def main():
 		sys.exit("Gate C FAILED: the rebuilt bulk does not hash-match its header")
 	print(f"Gate C  OK: database {rebuilt_info['db_size']} bytes, "
 		  f"bulk low={rebuilt_info['low_size']} medium={rebuilt_info['medium_size']}, hashes match")
+
+	name_ok, name_msg = check_name_buffer(args.out)
+	if not name_ok:
+		sys.exit(f"Gate N FAILED: {name_msg}")
+	print(f"Gate N  OK: {name_msg}")
 
 	parsed, total = count_parsed_maniblocks(args.out)
 	print(f"Gate B  {parsed}/{total} ManiBlocks parse")

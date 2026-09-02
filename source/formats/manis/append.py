@@ -138,3 +138,32 @@ def append_clip(data: bytes, manis, donor: str, new_name: str, keys_end: int) ->
 		data[layout["info_end"]:keys_end], block,
 		data[keys_end:],
 	))
+
+
+def retoken_clips(data: bytes, manis, old: str, new: str) -> bytes:
+	"""Rewrite the species token in a bundle's clip names, in place.
+
+	Lets a pristine bundle from a donor species be dropped into a renamed mod
+	without going through the OVL: the token lives ONLY in the clip-name ZStrings
+	(measured on Deinosuchus' idle bundle - 29 occurrences, all in the names
+	region, none elsewhere in the file), so this is the same preamble splice
+	`append_clip` performs.
+
+	Pass the token WITH its `$` separator - `deinosuchus$` not `deinosuchus` - or
+	an opponent reference like `fightfinishadeinosuchusleft` gets rewritten too and
+	the fight pairing silently stops matching.
+
+	`mani_files_size` and `hash_block_size` are untouched: the clip COUNT and the
+	bone-name string count are both unchanged, and those are what they measure.
+	"""
+	if "$" not in old:
+		raise ValueError(f"refusing to retoken on {old!r}: pass the token with its '$' "
+						 f"separator, or opponent names in clip titles are hit too")
+	names = [str(i.name) for i in manis.mani_infos]
+	hits = [n for n in names if old in n]
+	if not hits:
+		raise ValueError(f"no clip name contains {old!r}")
+
+	layout = preamble_layout(manis)
+	rebuilt = b"".join(_zstring(n.replace(old, new)) for n in names)
+	return (data[:layout["names_start"]] + rebuilt + data[layout["names_end"]:])

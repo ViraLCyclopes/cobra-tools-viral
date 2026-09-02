@@ -72,7 +72,12 @@ class Animation:
 		if bpy.app.version >= (5, 0, 0):
 			action_slot = action.slots[0]
 			def create_fcurve(*args, **kwargs):
-				kwargs["group_name"] = kwargs.pop("action_group")
+				# `action_group` is optional - the constraint branch below omits it.
+				# Popping unconditionally raises KeyError and kills the whole import
+				# on Blender 5.x, which is what broke .manis import there.
+				group = kwargs.pop("action_group", None)
+				if group is not None:
+					kwargs["group_name"] = group
 				channelbag = anim_utils.action_ensure_channelbag_for_slot(action, action_slot)
 				return channelbag.fcurves.ensure(*args, **kwargs)
 		else:

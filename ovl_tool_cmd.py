@@ -13,6 +13,8 @@ Subcommands:
   motiongraph-report - render the anonymous state graph or decision tree
   motiongraph-capacity - audit reusable allocation slack and dormant topology
   motiongraph-census   - count decoded graph objects; diff two builds for orphans
+  motiongraph-chooser  - list/grow/re-weight a random animation chooser
+  motiongraph-diff     - capture one build's edits as a replayable patch plan
   motiongraph-grow-null-prefix - experimental fixed-pool logical array growth
   motiongraph-retarget-clip - repoint references to an existing same-pool clip string
   motiongraph-string-slot   - replace text within one existing string allocation
@@ -529,6 +531,125 @@ def cmd_motiongraph_report(args: argparse.Namespace) -> None:
         )
 
 
+def cmd_motiongraph_diff(args: argparse.Namespace) -> None:
+    """Diff two builds' STATIC pools into a replayable patch plan.
+
+    This is the recovery route for motiongraph edits. An extracted .motiongraph is
+    faithful XML but SEMANTIC - it carries pool_type, never pool:offset - and
+    MotiongraphLoader.create() is not implemented, so there is no way back in from
+    it. Recording what changed as bytes and replaying with motiongraph-apply is.
+
+    Fragment retargets and topology growth cannot be expressed as a byte patch;
+    both are reported so a recovery is never silently partial.
+    """
+    from pathlib import Path
+    from source.formats.motiongraph.diff import diff_motiongraph, write_plan
+
+    game = resolve_game_label(args.game)
+    stock, edited = Path(args.ovl).resolve(), Path(args.against).resolve()
+    ensure_exists(str(stock), "file")
+    ensure_exists(str(edited), "file")
+    try:
+        report = diff_motiongraph(stock, edited, game)
+    except Exception as exc:
+        die(f"motiongraph diff failed: {exc}")
+    for warning in report.warnings:
+        logging.warning(warning)
+    print(f"changed_pools={report.changed_pools} changed_bytes={report.changed_bytes} "
+          f"edits={report.edits} fragments_retargeted={report.fragments_retargeted} "
+          f"fragment_delta={report.fragment_delta}")
+    if args.plan:
+        written = write_plan(report, Path(args.plan))
+        logging.success(f"Wrote {report.edits}-edit recovery plan: {written}")
+        if report.warnings:
+            logging.warning(
+                "The plan is INCOMPLETE - re-run the scripts for the operations listed above")
+
+
+def cmd_motiongraph_chooser(args: argparse.Namespace) -> None:
+    """List, grow, or re-weight a RandomAnimationActivity chooser.
+
+    A chooser picks among clips BY NAME, so adding one needs no Activity wrapper,
+    no payload, no state and no edge - just a name string and one more array slot.
+    That is what makes "give this species another idle/preen/rest" a small edit.
+
+    Weights are relative; the engine draws from their sum. The share is printed so
+    the number you want ("about 15%") maps to a weight without arithmetic.
+    """
+    from pathlib import Path
+    from source.formats.motiongraph.chooser_growth import (
+        grow_random_animation_chooser, list_choosers, set_chooser_weights)
+
+    game = resolve_game_label(args.game)
+    source = Path(args.ovl).resolve()
+    ensure_exists(str(source), "file")
+
+    if not args.add and not args.weights:
+        try:
+            rows = list_choosers(source, args.name, game)
+        except Exception as exc:
+            die(f"could not read choosers: {exc}")
+        if args.match:
+            needle = args.match.casefold()
+            rows = [r for r in rows
+                    if any(needle in c["short"].casefold() for c in r["clips"])]
+        for row in rows:
+            print(f"chooser {row['pool']}:{row['offset']}  {row['count']} clips  "
+                  f"blend {row['blend_time']:.2f}  flags {row['flags']}"
+                  + ("   (flags 8 ignores blend_time)" if row["flags"] == 8 else ""))
+            for index, clip in enumerate(row["clips"]):
+                print(f"    [{index}] {clip['short']:28s} weight {clip['weight']:4d}"
+                      f"  {clip['share']:6.1%}")
+        if not rows:
+            print("no choosers matched")
+        return
+
+    if not args.output:
+        die("--add and --weights write a file; pass -o/--output (a staged family)")
+    output = Path(args.output).resolve()
+    if args.chooser is None:
+        die("--add and --weights need --chooser POOL:OFFSET (see the plain listing)")
+    try:
+        pool_text, offset_text = str(args.chooser).split(":")
+        chooser_pool, chooser_offset = int(pool_text), int(offset_text)
+    except ValueError:
+        die(f"--chooser must look like POOL:OFFSET, got {args.chooser!r}")
+
+    if args.add:
+        try:
+            report = grow_random_animation_chooser(
+                source, output, chooser_pool, chooser_offset, args.add,
+                weight=args.weight, name=args.name, game=game)
+        except Exception as exc:
+            die(f"could not add the clip: {exc}")
+        logging.success(f"{report.entries_before} -> {report.entries_after} clips; "
+                        f"array {report.old_array} -> {report.new_array}; "
+                        f"+{report.pool_growth} bytes")
+        for clip in report.names:
+            print("   ", clip)
+        logging.warning("Cobra reload is not proof - verify with motiongraph-census "
+                        "--against and then in game")
+        source = output
+
+    if args.weights:
+        try:
+            weights = [int(x) for x in str(args.weights).replace(" ", "").split(",") if x]
+        except ValueError:
+            die(f"--weights must be a comma-separated integer list, got {args.weights!r}")
+        if source != output and not output.is_file():
+            die("stage the complete OVL family at --output first")
+        try:
+            row = set_chooser_weights(source if source != output else args.ovl,
+                                      output, chooser_pool, chooser_offset,
+                                      weights, args.name, game)
+        except Exception as exc:
+            die(f"could not set weights: {exc}")
+        logging.success("weights updated")
+        for index, clip in enumerate(row["clips"]):
+            print(f"    [{index}] {clip['short']:28s} weight {clip['weight']:4d}"
+                  f"  {clip['share']:6.1%}")
+
+
 def cmd_motiongraph_census(args: argparse.Namespace) -> None:
     """Census decoded motiongraph objects, optionally diffing two builds.
 
@@ -828,7 +949,7 @@ def build_parser() -> argparse.ArgumentParser:
     # retarget-family
     p_ret = sub.add_parser(
         "retarget-family",
-        help="Retarget a complete JWE3 asset family with a fixed-width djb2 alias.",
+        help="DEPRECATED - fixed-width djb2 alias only. Use the GUI's Rename Species Family (source/formats/ovl/species_rename.py); different-length renames are game-verified and this width constraint is retired.",
     )
     p_ret.add_argument(
         "ovl",
@@ -952,6 +1073,41 @@ def build_parser() -> argparse.ArgumentParser:
         choices=game_vals if game_vals else None,
     )
     p_mgn.set_defaults(func=cmd_motiongraph_census)
+
+    # motiongraph-chooser
+    p_mgh = sub.add_parser(
+        "motiongraph-chooser",
+        help="List / grow / re-weight a random animation chooser (rest, preen, eat...).",
+    )
+    p_mgh.add_argument("ovl", help="Source OVL; never modified unless -o is given.")
+    p_mgh.add_argument("--match", help="Only list choosers containing this clip substring.")
+    p_mgh.add_argument("--chooser", help="Target chooser as POOL:OFFSET, from the listing.")
+    p_mgh.add_argument("--add", help="Clip name to append, e.g. 'Species$Rest03'.")
+    p_mgh.add_argument("--weight", type=int, help="Weight for the added clip.")
+    p_mgh.add_argument("--weights", help="Comma-separated weights for every clip, in order.")
+    p_mgh.add_argument("-o", "--output", help="Staged same-named OVL to write.")
+    p_mgh.add_argument("--name", help="Internal .motiongraph name; auto-detected.")
+    p_mgh.add_argument(
+        "-g", "--game", default="Jurassic World Evolution 3",
+        choices=game_vals if game_vals else None,
+    )
+    p_mgh.set_defaults(func=cmd_motiongraph_chooser)
+
+    # motiongraph-diff
+    p_mgd = sub.add_parser(
+        "motiongraph-diff",
+        help="Diff two builds into a replayable patch plan (motiongraph recovery).",
+    )
+    p_mgd.add_argument("ovl", help="Baseline OVL to replay ONTO; never modified.")
+    p_mgd.add_argument(
+        "--against", required=True, help="Edited OVL whose changes should be captured.",
+    )
+    p_mgd.add_argument("--plan", help="Write the patch plan here.")
+    p_mgd.add_argument(
+        "-g", "--game", default="Jurassic World Evolution 3",
+        choices=game_vals if game_vals else None,
+    )
+    p_mgd.set_defaults(func=cmd_motiongraph_diff)
 
     # motiongraph-grow-null-prefix
     p_mgg = sub.add_parser(
