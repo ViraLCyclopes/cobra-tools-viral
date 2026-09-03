@@ -314,7 +314,14 @@ def retime_mani_info(data, clip_name, frames, duration):
 
 
 def read_jacl(path):
-	"""Read a JACL sample array - the interchange the Blender exporter writes."""
+	"""Read a JACL sample array.
+
+	JACL is the neutral uncompressed interchange between decoding and the ACL
+	encoder - the format jwe3_acl_decode.exe emits. It is written internally when
+	rebuilding a bundle, and accepted here so samples generated OUTSIDE Blender
+	(scripted motion, retargeting, math-driven curves) can replace a clip. The
+	Blender addon does not read or write JACL - it goes straight to .manis.
+	"""
 	import struct as _struct
 
 	with open(path, "rb") as fh:
@@ -346,7 +353,7 @@ def resolve_tracks(spec, bone_names):
 
 
 def replace_clip_samples(manis_path, streams, headers, clip_name, jacl_path,
-						 hold=()):
+						 hold=(), unstrip=False, unstripped_out=None):
 	"""Swap one clip's animation for samples authored outside the game.
 
 	This is the Blender export path. The bundle is NOT rebuilt from scratch -
@@ -412,6 +419,40 @@ def replace_clip_samples(manis_path, streams, headers, clip_name, jacl_path,
 		# retimed: resample the mask along time, nearest sample
 		src = np.rint(np.linspace(0, template.shape[0] - 1, incoming.shape[0])).astype(int)
 		mask = np.isnan(template)[src]
+	# `unstrip` keeps sub-tracks the author actually animated, instead of forcing
+	# them back to vanilla's stripped set. The old comment above said storing more
+	# than vanilla is what makes animals crush and stretch; that was wrong. Storing
+	# more is INERT, because the engine poses only bones set in the clip's bone mask
+	# (source/formats/manis/bonemask.py) - game-verified 2026-09-02. So the data can
+	# be kept, and the bones are reported back for their mask bits to be set.
+	#
+	# "Authored" means the incoming track VARIES over time. Blender hands back a
+	# full pose for every bone, so presence is not authorship - a bone the animator
+	# never touched arrives as a constant rest pose, and un-stripping those would
+	# store 170 constant tracks and gain nothing.
+	authored = np.zeros(template.shape[1], dtype=bool)
+	if unstrip:
+		# ROTATION only. The bone mask gates rotation - its population equals the
+		# clip's anim_rot + const_rot - and a bone's ori is often stripped while its
+		# pos or scl is stored, so testing all ten components finds nothing at all.
+		ORI = slice(0, 4)
+		stripped_bones = np.isnan(template[:, :, ORI]).all(axis=0).all(axis=-1)
+		with np.errstate(invalid="ignore"):
+			block = incoming[:, :, ORI]
+			spread = np.nanmax(block, axis=0) - np.nanmin(block, axis=0)
+		# 1e-5 is below the Blender round-trip noise floor, measured at ~0.0096.
+		# Untouched stripped bones come back with EXACTLY 0.0 spread, so anything
+		# above a hair separates authored from noise.
+		varies = np.nan_to_num(spread, nan=0.0).max(axis=-1) > 1e-3
+		authored = stripped_bones & varies
+		if unstripped_out is not None:
+			unstripped_out.extend(int(b) for b in np.nonzero(authored)[0])
+		if authored.any():
+			mask = mask.copy()
+			mask[:, authored, ORI] = False
+			print(f"           un-stripped {int(authored.sum())} authored bone(s): "
+				  f"{', '.join(str(int(b)) for b in np.nonzero(authored)[0][:8])}"
+				  f"{' ...' if authored.sum() > 8 else ''}")
 	dropped = int((mask & ~np.isnan(incoming)).sum())
 	incoming = np.where(mask, np.float32("nan"), incoming)
 	if dropped:
@@ -460,6 +501,31 @@ def replace_clip_samples(manis_path, streams, headers, clip_name, jacl_path,
 			  f"{', '.join(str(t) for t in hold)}")
 	streams[index].values = incoming
 	samples = values.shape[0]
+
+	# A clip's paired SCALAR stream must follow it through a retime. Without this
+	# the transform stream is lengthened and the scalar one is left at its old
+	# length - exactly what happened to rest03 (364 transform samples against 185
+	# scalar), which the game tolerates but which makes the bundle inconsistent and
+	# broke re-import until normalize_frame_count learned to resample. The pairing
+	# is the same one resample_clip uses: the scalar stream sits at index + 1.
+	# The target is frame_count, NOT the transform sample count: measured across
+	# this bundle, 29 of 30 clips have scalar length == frame_count, and a
+	# wrap-optimised clip stores one fewer transform sample than it declares. The
+	# single exception is rest03, the clip whose scalar was never retimed - the
+	# defect this exists to prevent.
+	_wrap_fc = samples + 1 if wrap else samples
+	if samples != before and index + 1 < len(headers) 			and headers[index + 1]["track_type"] != QVVF:
+		scal = streams[index + 1].values
+		old_n = scal.shape[0]
+		if old_n > 1 and _wrap_fc > 1:
+			src = np.linspace(0, old_n - 1, _wrap_fc)
+			lo = np.floor(src).astype(int)
+			hi = np.minimum(lo + 1, old_n - 1)
+			w = (src - lo).reshape(-1, *([1] * (scal.ndim - 1)))
+			streams[index + 1].values = (scal[lo] * (1.0 - w) + scal[hi] * w).astype(scal.dtype)
+			print(f"           scalar stream retimed with the clip: "
+				  f"{old_n} -> {_wrap_fc} samples (== frame_count)")
+
 	frame_count = samples + 1 if wrap else samples
 	duration = (samples if wrap else samples - 1) / streams[index].sample_rate
 	print(f"  replace: '{clip_name}' {before} -> {samples} samples from "
@@ -533,6 +599,26 @@ def main():
 						 "bone is safe, which is why the crush/stretch result does not "
 						 "settle the stripped-set contract. "
 						 "e.g. 'species$rest03:def_c_jaw_joint:pos'")
+	ap.add_argument("--unstrip", action="store_true",
+					help="with --replace-clip, KEEP sub-tracks the author actually "
+						 "animated on bones vanilla stripped, and set their bone-mask "
+						 "bits so the engine poses them. Without this the splice "
+						 "discards them - which is why a Blender-authored bone that "
+						 "vanilla stripped never moved in game.")
+	ap.add_argument("--no-mask", action="store_true",
+					help="do NOT set the bone mask bit for sub-tracks stored by "
+						 "--store-sub. The mask is the engine's gate: a stored "
+						 "sub-track whose bit is clear passes every offline check "
+						 "and still does not animate in game. Setting it is the "
+						 "default because the half-change is silent - only pass "
+						 "this if you are deliberately testing the gate.")
+	ap.add_argument("--sync-mask", action="store_true",
+					help="set mask bits for EVERY bone that has stored data in "
+						 "every clip, not just the ones --store-sub touched. This "
+						 "is the step a Blender-authored .manis needs: Blender "
+						 "knows about keyframes but nothing about the mask, so an "
+						 "exported clip animates a bone only if its bit happens to "
+						 "be set already.")
 	ap.add_argument("--store-animate", action="store_true",
 					help="make --store-offset sweep over the clip (0 -> full -> 0) "
 						 "instead of holding a constant. ACL classifies a sub-track as "
@@ -610,6 +696,7 @@ def main():
 		print(f"  dense: '{args.dense_clip}' filled from the bind pose - "
 			  f"fully stripped bones {_was} -> {_now}, every sub-track will be stored")
 
+	_stored_for_mask = {}
 	if args.store_sub:
 		# Same mechanism as --dense-clip but scoped to one (clip, bone, group).
 		# Filling the samples is both necessary AND sufficient: once a sub-track
@@ -635,6 +722,7 @@ def main():
 			si = _tf2[_names2.index(clip_name)]
 			lo, hi = _groups[group]
 			v = streams[si].values
+			_stored_for_mask.setdefault(clip_name, [])
 			if bone_name == "*":
 				# Every sub-track vanilla stripped in this group. A shotgun: it loses
 				# per-bone attribution but answers "is ANY added sub-track ever read?"
@@ -650,6 +738,8 @@ def main():
 			else:
 				sys.exit(f"--store-sub: no bone named '{bone_name}' in the {len(_bones)} "
 						 f"bone skeleton")
+			if group == "ori":
+				_stored_for_mask[clip_name].extend(tracks)
 			for track in tracks:
 				if track >= v.shape[1]:
 					sys.exit(f"--store-sub: track {track} is past this clip's "
@@ -733,8 +823,12 @@ def main():
 		hold += [i for i, n in enumerate(bone_names)
 				 if re.fullmatch(r".+_L\d+", n) and i not in hold]
 		hold = sorted(set(hold))
+		_unstripped = []
 		streams, resampled, new_duration = replace_clip_samples(
-			args.manis, streams, headers, args.replace_clip, args.jacl, hold)
+			args.manis, streams, headers, args.replace_clip, args.jacl, hold,
+			unstrip=args.unstrip, unstripped_out=_unstripped)
+		if _unstripped:
+			_stored_for_mask.setdefault(args.replace_clip, []).extend(_unstripped)
 
 	if args.resample_clip:
 		streams, resampled, new_duration = resample_clip(
@@ -842,6 +936,53 @@ def main():
 	print(f"Gate F  OK: {len(transforms)}/{len(transforms)} transform clips have has_database=1")
 	if worst:
 		print(f"Gate A  scalar streams max abs error {worst:.2e}")
+	# The mask is the second half of the change. A stored sub-track whose mask bit
+	# is clear passes every gate above and still does not animate in game, so this
+	# runs by default rather than being opt-in.
+	if (_stored_for_mask or args.sync_mask) and not args.no_mask:
+		from source.formats.manis.bonemask import find_mask, set_bits
+		# NB: do NOT import decode_file here - a function-local import shadows the
+		# module-level name for the whole of main(), which broke the earlier call.
+		from source.formats.manis.acl_patch import parse_transform_layout
+		# _MF2 is bound only inside the --store-sub branch; --replace-clip reaches
+		# here without it, so import locally rather than depend on that branch.
+		from generated.formats.manis import ManisFile as _MFmask
+		out = bytearray(open(args.out, "rb").read())
+		_m3 = _MFmask(); _m3.game = "Jurassic World Evolution 3"; _m3.load(args.out)
+		_n3 = [str(i.name) for i in _m3.mani_infos]
+		_b3 = [(o, sz) for o, sz in list_clip_blobs(bytes(out))
+			   if read_blob_header(bytes(out), o)["track_type"] == QVVF]
+		# --sync-mask derives the bits from what is actually stored, which is what a
+		# Blender-authored clip needs: Blender knows keyframes, not the mask.
+		synced = {}
+		if args.sync_mask:
+			decoded = [st for st in decode_file(args.out) if st.track_type == QVVF]
+			for nm, st in zip(_n3, decoded):
+				vals = st.values
+				synced[nm] = [b for b in range(vals.shape[1])
+							  if not np.isnan(vals[:, b, 0:4]).all()]
+		touched = skipped = 0
+		for name, (off, sz) in zip(_n3, _b3):
+			want = sorted(set(_stored_for_mask.get(name, [])) | set(synced.get(name, [])))
+			if not want:
+				continue
+			lay = parse_transform_layout(bytes(out[off:off + sz]))
+			mo = find_mask(bytes(out), off, lay.num_tracks)
+			if mo is None:
+				skipped += 1
+				print(f"  mask: '{name}' record NOT located - {len(want)} stored "
+					  f"sub-track(s) will NOT animate in game")
+				continue
+			before, after = set_bits(out, mo, lay.num_tracks, want)
+			if after != before:
+				touched += 1
+				print(f"  mask: '{name}' popcount {before} -> {after}")
+		if touched:
+			with open(args.out, "wb") as fh:
+				fh.write(bytes(out))
+			data = bytes(out)
+		if skipped:
+			print(f"  mask: {skipped} clip(s) could not be located - see bonemask.py")
 	print(f"wrote {args.out} ({len(data)} bytes)")
 	return 0
 

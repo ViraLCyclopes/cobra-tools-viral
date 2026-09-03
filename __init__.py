@@ -1,4 +1,4 @@
-# blender plugin version is auto-synced with pyproject.toml version
+﻿# blender plugin version is auto-synced with pyproject.toml version
 bl_info = {
 	"name": "Frontier's Cobra Engine Formats",
 	"author": "Harlequinz Ego, HENDRIX et al.",
@@ -157,6 +157,8 @@ if bpy_available:
 			self.layout.operator(ExportSPL.bl_idname, text="Cobra Spline (.spl)", icon_value=icon)
 			self.layout.operator(ExportBanis.bl_idname, text="Cobra Baked Anim (.banis)", icon_value=icon)
 			self.layout.operator(ExportManis.bl_idname, text="Cobra Anim (.manis)", icon_value=icon)
+			self.layout.operator(ExportJacl.bl_idname, text="Cobra Anim Samples, JWE3 compressed (.jacl)", icon_value=icon)
+			self.layout.operator(ExportManisSplice.bl_idname, text="Cobra Anim, splice into bundles (.manis)", icon_value=icon)
 
 
 		def menu_func_import(self, context):
@@ -257,6 +259,9 @@ if bpy_available:
 			COBRA_PT_model,
 			COBRA_PT_scene,
 			COBRA_PT_viewport,
+			COBRA_PT_splice,
+			COBRA_OT_splice_toggle,
+			COBRA_OT_splice_set_all,
 			COBRA_UL_lod,
 			COBRA_UL_matcol_slot,
 			COBRA_MOD_PT_mod,
@@ -275,6 +280,8 @@ if bpy_available:
 			ExportFgm,
 			ExportMS2,
 			ExportManis,
+			ExportJacl,
+			ExportManisSplice,
 			ExportSPL,
 			ExtrudeFins,
 			GenerateRigEdit,

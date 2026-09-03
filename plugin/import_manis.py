@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 import math
 import os
 import time
@@ -260,7 +260,8 @@ def load(reporter, files=(), filepath="", disable_ik=False, set_fps=False):
 						f"ACL scalar count mismatch for {mi.name}: "
 						f"{scalar_stream.track_count} != {mi.float_count}"
 					)
-				k.floats = normalize_frame_count(scalar_stream.values[:, :, 0], mi.frame_count)
+				k.floats = normalize_frame_count(scalar_stream.values[:, :, 0], mi.frame_count,
+												 resample=True, label=str(mi.name))
 			mi.dtype.compression = 0
 			mi.dtype.has_list = 0
 			k.reset_field("pos_bones")

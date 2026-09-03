@@ -1,3 +1,4 @@
+﻿import logging
 import logging
 import math
 import os
@@ -156,6 +157,23 @@ def save(reporter, filepath="", per_armature=False, export_mode="SOURCE",
 
 		filepath = os.path.join(folder, export_name)
 		manis.save(filepath)
+		# The engine poses only bones whose bit is set in each clip's bone mask.
+		# Blender has no concept of that mask, so without this step an exported
+		# clip animates a bone only if the vanilla mask happened to allow it -
+		# and the failure is silent, which is exactly how it went unnoticed for
+		# eight sessions. Sync it from the data we just wrote.
+		if scene.cobra.game == "Jurassic World Evolution 3":
+			try:
+				from source.formats.manis.bonemask import sync_file
+				changed, missing = sync_file(filepath, logger=logging.info)
+				if changed:
+					reporter.show_info(f"Bone mask updated for {changed} clip(s)")
+				if missing:
+					reporter.show_warning(
+						f"{missing} clip(s): bone mask record not found - animated "
+						f"bones in those clips may not move in game")
+			except Exception as err:
+				reporter.show_warning(f"Bone mask sync failed: {err}")
 		reporter.show_info(f"Exported {export_name}")
 
 def needs_wsm(bone, game):

@@ -1,10 +1,11 @@
-import os
+﻿import os
 
 import bpy.utils.previews
 from bpy.props import StringProperty, BoolProperty, EnumProperty
 from bpy_extras.io_utils import ExportHelper
 
-from plugin import export_ms2, export_spl, export_manis, export_banis, export_fgm
+from plugin import (export_ms2, export_spl, export_manis, export_banis, export_fgm,
+                    export_jacl, export_splice)
 from plugin.utils.operators import BaseOp
 
 
@@ -64,6 +65,41 @@ class ExportSPL(ExportOp):
     filename_ext = ".spl"
     target = export_spl.save
     filter_glob: StringProperty(default="*.spl", options={'HIDDEN'})
+
+
+class ExportJacl(ExportOp):
+    """Export an action to .jacl samples for the JWE3 ACL encoder (.jacl)"""
+    bl_idname = "export_scene.cobra_jacl"
+    bl_label = 'Export JACL (JWE3 compressed)'
+    filename_ext = ".jacl"
+    target = export_jacl.save
+    filter_glob: StringProperty(default="*.jacl", options={'HIDDEN'})
+    action_source: EnumProperty(
+        name="Export",
+        description="Which actions to write",
+        items=(
+            ('ACTIVE', "Active Action",
+             "Only the armature's active action, into the chosen file"),
+            ('ALL', "All Actions",
+             "Every action in use, one .jacl each, named after the action, into the "
+             "chosen file's folder"),
+        ),
+        default='ACTIVE')
+    sample_rate: bpy.props.FloatProperty(
+        name="Sample Rate",
+        description="Written into the .jacl header. JWE3 uses 30.0003 for every clip "
+                    "in the game - all 604 measured - so leave this alone unless you "
+                    "know otherwise",
+        default=30.0003, precision=4)
+
+    def invoke(self, context, _event):
+        if not self.filepath:
+            arm = context.active_object
+            anim = getattr(arm, "animation_data", None) if arm else None
+            action = anim.action if anim else None
+            name = action.name.replace("$", "_") if action else "animation"
+            self.filepath = name + self.filename_ext
+        return super().invoke(context, _event)
 
 
 class ExportManis(ExportOp):
@@ -151,6 +187,44 @@ class ExportManis(ExportOp):
                       icon='INFO')
             box.label(text=f"so they go to '{manis_name}'.")
             box.label(text="Re-import them to record where they came from.")
+
+
+class ExportManisSplice(ExportOp):
+    """Splice edited actions back into their JWE3 .manis bundles (.manis)"""
+    bl_idname = "export_scene.cobra_manis_splice"
+    bl_label = 'Export Manis (splice into bundles)'
+    filename_ext = ".manis"
+    target = export_splice.save
+    filter_glob: StringProperty(default="*.manis", options={'HIDDEN'})
+    source_folder: StringProperty(
+        name="Source Bundles", subtype='DIR_PATH',
+        description="Folder holding the VANILLA .manis bundles. Each clip is routed "
+                    "back to the bundle its importer stamp names. These files are "
+                    "never written to")
+    ms2_path: StringProperty(
+        name="MS2", subtype='FILE_PATH',
+        description="The species models.ms2 - supplies the bind pose the ACL "
+                    "encoder compresses against")
+    action_source: EnumProperty(
+        name="Clips",
+        description="Which actions to splice",
+        items=(
+            ('CHANGED', "Changed Only (Recommended)",
+             "Every action that differs from its bundle. Untouched clips are left "
+             "byte-identical - our encoder is not Frontier's, so re-encoding a clip "
+             "you did not edit loses quality for nothing"),
+            ('SELECTED', "Ticked Only",
+             "Only actions ticked for export in the Cobra panel"),
+            ('ACTIVE', "Active Action",
+             "Only the armature's active action"),
+        ),
+        default='CHANGED')
+    unstrip: BoolProperty(
+        name="Enable Authored Bones", default=True,
+        description="Keep sub-tracks on bones Frontier stripped when you actually "
+                    "animated them, and set their bone-mask bits so the engine "
+                    "poses them. Without this such a bone exports cleanly and "
+                    "silently does not move in game")
 
 
 class ExportBanis(ExportOp):

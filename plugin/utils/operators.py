@@ -222,11 +222,29 @@ class TransferHairCombing(BaseOp):
 	target = hair.transfer_hair_combing
 
 
-class AddHair(BaseOp):
+class AddHair(PopupOp):
 	"""Add hair setup to active mesh and create shells and fins meshes"""
 	bl_idname = "object.add_hair"
 	bl_label = "Add Hair"
 	target = shell.add_hair
+	selected_only: BoolProperty(
+		name="Selected Faces Only",
+		description="Create the shell only from selected body faces; recommended for partial fur coverage",
+		default=False)
+	create_fins: BoolProperty(
+		name="Create Fins",
+		description="Create initial fin geometry now; use Update Fins again after editing the comb direction",
+		default=True)
+	use_local_fur_textures: BoolProperty(
+		name="Load Local DinosaurFur Textures",
+		description="Load shell.pshellmap and fin.pfinalphatexture PNG channels beside the imported MS2 for FGM export",
+		default=True)
+
+	def draw(self, context):
+		layout = self.layout
+		layout.prop(self, "selected_only")
+		layout.prop(self, "create_fins")
+		layout.prop(self, "use_local_fur_textures")
 
 
 class ApplyPoseAll(BaseOp):

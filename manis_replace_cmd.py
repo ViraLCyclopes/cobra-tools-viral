@@ -1,4 +1,4 @@
-"""Replace one ACL clip inside a JWE3 .manis, re-encoding it self-contained.
+﻿"""Replace one ACL clip inside a JWE3 .manis, re-encoding it self-contained.
 
 The replacement carries its bulk data inline, so the bundle's ACL database and
 every other clip are left untouched.
@@ -7,10 +7,16 @@ every other clip are left untouched.
   python manis_replace_cmd.py IN.manis --clip 0 --out OUT.manis --jacl edited.0.jacl
   python manis_replace_cmd.py IN.manis --list
 
-Then inject with (--update-aux is mandatory or textures break):
+Then inject with BOTH --update and --update-aux:
 
   python ovl_tool_cmd.py inject IN.ovl -g "Jurassic World Evolution 3" \\
-      -f OUT.manis -o OUT.ovl --update-aux
+      -f OUT.manis -o OUT.ovl --update --update-aux
+
+--update-aux is mandatory or textures break. --update is mandatory too:
+without it add_files re-creates the loader, which silently rewrites the
+.ovs.Anim_* streams smaller. The archive saves, round-trips and extracts
+byte-perfect, and then the game crashes on spawn - that cost four deploys
+on 2026-09-02 before it was found.
 """
 import argparse
 import os

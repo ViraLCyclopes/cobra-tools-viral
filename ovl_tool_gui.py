@@ -1,4 +1,4 @@
-import contextlib
+﻿import contextlib
 import os
 import shutil
 import subprocess
@@ -577,8 +577,42 @@ class MainWindow(window.MainWindow):
 			common_root_dir = os.path.dirname(files[0])
 			self.cfg["dir_inject"] = common_root_dir
 			self.set_dirty()
-			self.run_in_threadpool(self.ovl_data.add_files, (), files, common_root_dir)
+			self.run_in_threadpool(self._inject_files, (), files, common_root_dir)
 		# the gui is updated from the signal ovl.files_list emitted from add_files
+
+	def _inject_files(self, files, common_root_dir):
+		"""Update files that already exist in place; only genuinely new ones are added.
+
+		add_files re-creates the loader, which allocates fresh pools and data entries
+		and leaves the OVL structurally different from the one that was loaded. JWE3
+		rejects that even when the injected file is byte-identical to what came out -
+		it saves happily, passes a round trip, and then crashes on load. The CLI has
+		had --update for this; the GUI did not, so every GUI injection into a JWE3
+		dinosaur OVL produced a broken archive with no way for the user to avoid it.
+		"""
+		existing, new = [], []
+		for file_path in files:
+			loader = self.ovl_data.loaders.get(os.path.basename(file_path))
+			(existing if loader is not None else new).append(file_path)
+		updated = 0
+		for file_path in existing:
+			name = os.path.basename(file_path)
+			loader = self.ovl_data.loaders.get(name)
+			try:
+				loader.update_in_place(file_path)
+				updated += 1
+				logging.success(f"Updated {name} in place")
+			except NotImplementedError:
+				# this format has no in-place path - fall back rather than refuse
+				logging.warning(f"{name}: no in-place update, falling back to add_files")
+				new.append(file_path)
+			except Exception as err:
+				logging.warning(f"{name}: in-place update failed ({err}), falling back")
+				new.append(file_path)
+		if new:
+			self.ovl_data.add_files(new, common_root_dir)
+		if updated:
+			logging.info(f"Injected {updated} file(s) in place, {len(new)} added")
 
 	def get_replace_strings(self):
 		old = self.e_name_old.toPlainText()

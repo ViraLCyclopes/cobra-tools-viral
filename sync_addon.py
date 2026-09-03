@@ -1,4 +1,4 @@
-"""Content-diff this repo into the installed Blender add-on copy.
+﻿"""Content-diff this repo into the installed Blender add-on copy.
 
 Blender loads cobra-tools from its own addons folder, not from this repo, so an
 edit here has no effect until it is copied across. This walks the source trees
@@ -22,14 +22,51 @@ import shutil
 import sys
 
 REPO = os.path.dirname(os.path.abspath(__file__))
-ADDON = os.path.join(
-    os.environ.get("APPDATA", ""),
-    "Blender Foundation", "Blender", "4.5", "scripts", "addons", "cobra-tools-master",
-)
+BLENDER_ROOT = os.path.join(os.environ.get("APPDATA", ""), "Blender Foundation", "Blender")
+
+
+def installed_versions():
+    """Blender versions that have a cobra-tools add-on folder, newest last."""
+    if not os.path.isdir(BLENDER_ROOT):
+        return []
+    found = []
+    for name in os.listdir(BLENDER_ROOT):
+        path = os.path.join(BLENDER_ROOT, name, "scripts", "addons", "cobra-tools-master")
+        if os.path.isdir(path):
+            try:
+                key = tuple(int(x) for x in name.split("."))
+            except ValueError:
+                key = (0,)
+            found.append((key, name, path))
+    return [(n, p) for _k, n, p in sorted(found)]
+
+
+def addon_path(version=None):
+    """Resolve which add-on copy to sync into.
+
+    The version was hard-coded to 4.5, which silently synced into an install the
+    user was not running - edits appeared to have no effect in Blender. Default to
+    the NEWEST installed copy and print which one, so the target is never a guess.
+    """
+    installed = installed_versions()
+    if version:
+        for name, path in installed:
+            if name == version:
+                return path
+        raise SystemExit(f"no cobra-tools add-on for Blender {version}; "
+                         f"found: {', '.join(n for n, _ in installed) or 'none'}")
+    if not installed:
+        raise SystemExit(f"no cobra-tools add-on found under {BLENDER_ROOT}")
+    return installed[-1][1]
+
+
+ADDON = addon_path()
 
 # the trees Blender actually imports from; bin/ carries the ACL decoder exe
 TREES = ("plugin", "source", "generated", "modules", "constants", "utils", "bin")
-ROOT_FILES = ("__init__.py", "__version__.py")
+# manis_database_cmd carries the game-verified bundle rebuild; the Blender splice
+# exporter calls it, so it has to reach the add-on copy too.
+ROOT_FILES = ("__init__.py", "__version__.py", "manis_database_cmd.py")
 
 SKIP_NAMES = {"config.json"}
 SKIP_DIRS = {"__pycache__", ".git", "logs", "dumps"}
@@ -62,9 +99,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true",
                         help="report what differs without copying")
-    parser.add_argument("--addon", default=ADDON,
-                        help="destination add-on folder")
+    parser.add_argument("--blender", metavar="VERSION",
+                        help="Blender version to sync into, e.g. 5.2. Defaults to the "
+                             "newest installed cobra-tools add-on.")
+    parser.add_argument("--addon", default=None,
+                        help="destination add-on folder (overrides --blender)")
     args = parser.parse_args()
+
+    if args.addon is None:
+        args.addon = addon_path(args.blender)
+    versions = ", ".join(n for n, _ in installed_versions()) or "none"
+    print(f"add-on installs found: {versions}")
+    print(f"syncing into: {args.addon}")
 
     if not os.path.isdir(args.addon):
         print(f"add-on folder not found: {args.addon}", file=sys.stderr)

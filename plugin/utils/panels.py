@@ -310,3 +310,66 @@ class COBRA_PT_object(PropertiesPanel):
 		layout.operator("object.cobra_generate_mirror_rig", icon="MOD_MIRROR")
 		layout.operator("object.cobra_bake_mirror_rig", icon="ACTION_TWEAK")
 		layout.operator("object.cobra_remove_mirror_rig_constraints", icon="CONSTRAINT_BONE")
+
+
+class COBRA_OT_splice_toggle(bpy.types.Operator):
+	"""Tick or untick this clip for 'Export Manis (splice into bundles)'"""
+	bl_idname = "cobra.splice_toggle"
+	bl_label = "Toggle Clip For Splice"
+	bl_options = {'REGISTER', 'UNDO'}
+	action_name: bpy.props.StringProperty()
+
+	def execute(self, context):
+		action = bpy.data.actions.get(self.action_name)
+		if action is not None:
+			action["cobra_splice"] = 0 if action.get("cobra_splice") else 1
+		return {'FINISHED'}
+
+
+class COBRA_OT_splice_set_all(bpy.types.Operator):
+	"""Tick or clear every imported clip"""
+	bl_idname = "cobra.splice_set_all"
+	bl_label = "Set All Clips For Splice"
+	bl_options = {'REGISTER', 'UNDO'}
+	state: bpy.props.BoolProperty(default=True)
+
+	def execute(self, context):
+		for action in bpy.data.actions:
+			if action.get("manis"):
+				action["cobra_splice"] = 1 if self.state else 0
+		return {'FINISHED'}
+
+
+class COBRA_PT_splice(ViewportPanel):
+	"""Pick which clips the splice exporter writes.
+
+	The exporter's 'Changed Only' mode finds edited clips by itself, but an
+	animator may edit three clips and only want one shipped, so the ticks are the
+	explicit override. Only actions carrying an importer bundle stamp are listed -
+	anything else cannot be routed back to a bundle.
+	"""
+	bl_category = 'View'
+	bl_label = 'Cobra Splice Export (JWE3)'
+	bl_options = {'DEFAULT_CLOSED'}
+
+	def draw(self, context):
+		layout = self.layout
+		actions = [a for a in bpy.data.actions if a.get("manis")]
+		if not actions:
+			layout.label(text="No imported clips in this scene", icon='INFO')
+			return
+		row = layout.row(align=True)
+		row.operator("cobra.splice_set_all", text="Tick All", icon='CHECKBOX_HLT').state = True
+		row.operator("cobra.splice_set_all", text="Clear", icon='CHECKBOX_DEHLT').state = False
+		ticked = sum(1 for a in actions if a.get("cobra_splice"))
+		layout.label(text=f"{ticked} of {len(actions)} ticked  (mode: Ticked Only)")
+		col = layout.column(align=True)
+		for action in sorted(actions, key=lambda a: a.name):
+			on = bool(action.get("cobra_splice"))
+			row = col.row(align=True)
+			op = row.operator("cobra.splice_toggle", text="",
+							  icon='CHECKBOX_HLT' if on else 'CHECKBOX_DEHLT',
+							  emboss=False)
+			op.action_name = action.name
+			# clip names are 'species$clip'; the species half is the same for all
+			row.label(text=action.name.split("$")[-1])

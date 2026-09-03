@@ -1,4 +1,4 @@
-"""Bridge between Cobra's MANIS parser and the official ACL decoder helper."""
+﻿"""Bridge between Cobra's MANIS parser and the official ACL decoder helper."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import logging
 import numpy as np
 
 
@@ -164,11 +165,34 @@ def decode_blob(blob: bytes) -> AclSamples:
         return streams[0]
 
 
-def normalize_frame_count(values: np.ndarray, frame_count: int) -> np.ndarray:
+def normalize_frame_count(values: np.ndarray, frame_count: int,
+                         resample: bool = False, label: str = "") -> np.ndarray:
+    """Bring a decoded stream up to the frame count the ManiInfo declares.
+
+    `resample` linearly resamples instead of raising, and is used ONLY for scalar
+    streams. A clip that was lengthened by resampling its transform stream can be
+    left with its scalar stream at the original length - SarcoViral's rest03 ships
+    365 transform samples against 185 scalar ones and the game plays it happily,
+    so refusing to import it helps nobody. The mismatch is still logged, because
+    it is a real inconsistency in the file, not something to hide.
+
+    Transform streams stay strict: a length mismatch there is corruption.
+    """
     if len(values) == frame_count:
         return values
     if len(values) == frame_count - 1:
         return np.concatenate((values, values[:1]), axis=0)
+    if resample and len(values) > 1 and frame_count > 1:
+        logging.warning(
+            f"{label or 'clip'}: scalar stream has {len(values)} samples but "
+            f"{frame_count} frames are declared - resampling. The file is "
+            f"inconsistent; the transform stream was lengthened and this one "
+            f"was not.")
+        idx = np.linspace(0, len(values) - 1, frame_count)
+        lo = np.floor(idx).astype(int)
+        hi = np.minimum(lo + 1, len(values) - 1)
+        w = (idx - lo).reshape(-1, *([1] * (values.ndim - 1)))
+        return values[lo] * (1.0 - w) + values[hi] * w
     raise ValueError(
         f"ACL stream has {len(values)} samples but MANIS declares {frame_count} frames"
     )
