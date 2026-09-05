@@ -47,7 +47,9 @@ from source.formats.motiongraph.report import (
 	build_decision_report,
 	build_state_report,
 )
-from source.formats.motiongraph.static_patch import patch_string_slot, repoint_existing_string
+from source.formats.motiongraph.static_patch import (patch_string_slot, patch_string_slots,
+                                                     repoint_existing_string)
+from source.formats.motiongraph import audio_events
 
 
 def describe_motiongraph_field(path: str, kind: str = "") -> str:
@@ -397,6 +399,7 @@ class MainWindow(window.MainWindow):
 		self._build_retarget_tab()
 		self._build_rename_repair_tab()
 		self._build_capacity_tab()
+		self._build_audio_tab()
 		self._build_stage_tab()
 
 		# The body was initially inserted directly by MainWindow. Reparent it into
@@ -903,6 +906,73 @@ class MainWindow(window.MainWindow):
 		hint.setStyleSheet("color: #9aa0a6;")
 		layout.addWidget(hint)
 		self.tabs.addTab(page, "Rename Repair")
+
+	def _build_audio_tab(self):
+		page = QtWidgets.QWidget()
+		layout = QtWidgets.QVBoxLayout(page)
+		info = QtWidgets.QLabel(
+			"A motiongraph fires sounds BY NAME. To give a donor-based species its own voice, "
+			"rename those strings to your own prefix and ship a bank that answers them.<br><br>"
+			"<b>Not every name is safe to rename.</b> Some resolve from SHARED banks used by "
+			"several species; renaming one orphans the sound in both directions and it goes "
+			"silent with no error. Scan first - unsafe names are unticked and cannot be ticked."
+		)
+		info.setWordWrap(True)
+		layout.addWidget(info)
+
+		form = QtWidgets.QFormLayout()
+		self.audio_game = QtWidgets.QLineEdit()
+		self.audio_game.setPlaceholderText("Game folder, e.g. C:/.../Jurassic World Evolution 3")
+		game_row = QtWidgets.QHBoxLayout()
+		game_row.addWidget(self.audio_game, 1)
+		game_browse = QtWidgets.QPushButton("Browse...")
+		game_browse.clicked.connect(self.browse_audio_game)
+		game_row.addWidget(game_browse)
+		game_holder = QtWidgets.QWidget()
+		game_holder.setLayout(game_row)
+		self.audio_donor = QtWidgets.QLineEdit()
+		self.audio_donor.setPlaceholderText("Donor species, e.g. Indoraptor")
+		self.audio_prefix = QtWidgets.QLineEdit()
+		self.audio_prefix.setPlaceholderText("Your prefix, e.g. Indocapi - no longer than the donor")
+		form.addRow("Game folder", game_holder)
+		form.addRow("Donor species", self.audio_donor)
+		form.addRow("New prefix", self.audio_prefix)
+		layout.addLayout(form)
+
+		scan_button = QtWidgets.QPushButton("Scan graph for audio events")
+		scan_button.clicked.connect(self.scan_audio_events)
+		layout.addWidget(scan_button)
+
+		self.audio_list = QtWidgets.QTreeWidget()
+		self.audio_list.setHeaderLabels(["Event name", "Becomes", "Owned by"])
+		self.audio_list.setRootIsDecorated(False)
+		self.audio_list.setAlternatingRowColors(True)
+		layout.addWidget(self.audio_list, 1)
+
+		button_row = QtWidgets.QHBoxLayout()
+		tick_all = QtWidgets.QPushButton("Tick all safe")
+		tick_all.clicked.connect(lambda: self.set_audio_ticks(True))
+		untick_all = QtWidgets.QPushButton("Untick all")
+		untick_all.clicked.connect(lambda: self.set_audio_ticks(False))
+		button_row.addWidget(tick_all)
+		button_row.addWidget(untick_all)
+		button_row.addStretch(1)
+		layout.addLayout(button_row)
+
+		self.audio_apply = QtWidgets.QPushButton("Rename ticked events in staged family")
+		self.audio_apply.clicked.connect(self.apply_audio_rename)
+		layout.addWidget(self.audio_apply)
+
+		note = QtWidgets.QLabel(
+			"Renaming the graph is only one of three pieces. The prefab still needs "
+			"<b>MotionGraphName</b> pointed at your renamed graph, <b>AudioCore.Name</b> left on "
+			"the DONOR (it prefixes engine-generated footstep and death events that live in "
+			"shared banks), and your events declared in the audio registry - an undeclared event "
+			"is never posted at all."
+		)
+		note.setWordWrap(True)
+		layout.addWidget(note)
+		self.tabs.addTab(page, "Audio Events")
 
 	def _build_stage_tab(self):
 		page = QtWidgets.QWidget()
@@ -1936,6 +2006,103 @@ class MainWindow(window.MainWindow):
 				f"Replaced string slot and verified staged family: {report.changed_bytes} changed bytes"
 			)
 			self.census_guard("string-slot replacement", expect_added=0, expect_removed=0)
+		except Exception as exc:
+			self.showerror(str(exc))
+
+	# ---- Audio Events ---------------------------------------------------
+
+	def browse_audio_game(self):
+		dirpath = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose the game folder")
+		if dirpath:
+			self.audio_game.setText(dirpath)
+
+	def set_audio_ticks(self, ticked):
+		state = QtCore.Qt.Checked if ticked else QtCore.Qt.Unchecked
+		for index in range(self.audio_list.topLevelItemCount()):
+			item = self.audio_list.topLevelItem(index)
+			if item.flags() & QtCore.Qt.ItemIsUserCheckable:
+				item.setCheckState(0, state)
+
+	def scan_audio_events(self):
+		try:
+			donor = self.audio_donor.text().strip()
+			prefix = self.audio_prefix.text().strip()
+			if not donor:
+				raise ValueError("Enter the donor species, e.g. Indoraptor")
+			if not prefix:
+				raise ValueError("Enter your new prefix, e.g. Indocapi")
+			if len(prefix) > len(donor):
+				raise ValueError(
+					"'%s' is longer than '%s'. A renamed string has to fit its existing "
+					"allocation, so the new prefix must be no longer than the donor's."
+					% (prefix, donor)
+				)
+			game_root = Path(self.audio_game.text().strip())
+			if not (game_root / "Win64" / "ovldata").is_dir():
+				raise ValueError("Choose the game folder (the one containing Win64/ovldata)")
+
+			names = audio_events.scan_graph_event_names(
+				self.source_path(), donor, DEFAULT_GAME)
+			if not names:
+				raise ValueError("No '%s_*' audio event names in this motiongraph" % donor)
+			owned_ids = audio_events.donor_event_ids(game_root, donor, DEFAULT_GAME)
+			classified = audio_events.classify(names, donor, owned_ids)
+
+			self.audio_list.clear()
+			safe = 0
+			for name, owned in classified:
+				suffix = name[len(donor) + 1:]
+				item = QtWidgets.QTreeWidgetItem([
+					name,
+					("%s_%s" % (prefix, suffix)) if owned else "-",
+					("%s_events" % donor) if owned else "a SHARED bank - leave alone",
+				])
+				if owned:
+					item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+					item.setCheckState(0, QtCore.Qt.Checked)
+					safe += 1
+				else:
+					item.setFlags(item.flags() & ~QtCore.Qt.ItemIsUserCheckable)
+					item.setDisabled(True)
+				self.audio_list.addTopLevelItem(item)
+			for column in range(3):
+				self.audio_list.resizeColumnToContents(column)
+			self.status_bar.showMessage(
+				"%d audio events: %d safe to rename, %d owned by shared banks"
+				% (len(names), safe, len(names) - safe), 15000
+			)
+		except Exception as exc:
+			self.showerror(str(exc))
+
+	def apply_audio_rename(self):
+		try:
+			donor = self.audio_donor.text().strip()
+			prefix = self.audio_prefix.text().strip()
+			pairs = []
+			for index in range(self.audio_list.topLevelItemCount()):
+				item = self.audio_list.topLevelItem(index)
+				if not (item.flags() & QtCore.Qt.ItemIsUserCheckable):
+					continue
+				if item.checkState(0) != QtCore.Qt.Checked:
+					continue
+				name = item.text(0)
+				pairs.append((name, "%s_%s" % (prefix, name[len(donor) + 1:])))
+			if not pairs:
+				raise ValueError("Scan first, then tick at least one event")
+			pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+
+			report = patch_string_slots(
+				self.source_path(), self.output_path(), pairs, game=DEFAULT_GAME
+			)
+			message = ("Renamed %d audio events in one pass (%d changed bytes); "
+					   "staged family verified" % (report.renamed, report.changed_bytes))
+			if report.skipped:
+				message += " - %d skipped" % len(report.skipped)
+				for name, why in report.skipped:
+					logging.warning("Audio rename skipped %s: %s" % (name, why))
+			self.status_bar.showMessage(message, 15000)
+			logging.info(message)
+			self.census_guard("audio event rename", expect_added=0, expect_removed=0)
 		except Exception as exc:
 			self.showerror(str(exc))
 

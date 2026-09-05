@@ -222,3 +222,104 @@ def repoint_existing_string(source: Path, output: Path, source_text: str,
         output, len(changed), old_size, new_size, _topology(check),
         source_pool, source_offset, target_pool, target_offset, expected_count,
     )
+
+
+@dataclass(frozen=True)
+class BatchPatchReport:
+    output: Path
+    renamed: int
+    changed_bytes: int
+    compressed_before: int
+    compressed_after: int
+    topology: tuple[int, int, int, int]
+    skipped: list[tuple[str, str]]          # (name, why)
+
+
+def patch_string_slots(source: Path, output: Path, pairs, *,
+                       game: str = DEFAULT_GAME) -> BatchPatchReport:
+    """Replace MANY strings in one pass, each within its existing allocation.
+
+    patch_string_slot() reloads, republishes and re-verifies the whole family per
+    string, so renaming a species' 54 audio events meant 54 full rewrites of a
+    14 MB OVL - about 25 minutes. The work itself is a handful of byte writes, so
+    this collects every replacement against one decompressed STATIC buffer and
+    publishes once.
+
+    A pair whose source string is missing, ambiguous, or too long for its slot is
+    SKIPPED and reported rather than aborting the batch - one unusable name
+    should not cost the other fifty-three.
+    """
+    source, output = _require_staged_output(source, output)
+    ovl, static = _load(source, game)
+    original = _decompressed_static(source, ovl, static)
+
+    # Resolve every replacement against the UNMODIFIED buffer before writing any
+    # of them, so one edit cannot move another's offset out from under it.
+    plan: list[tuple[int, bytes, bytes]] = []
+    skipped: list[tuple[str, str]] = []
+    claimed: list[range] = []
+    for source_text, target_text in pairs:
+        if source_text == target_text:
+            skipped.append((source_text, "source and target identical"))
+            continue
+        try:
+            pool_index, pool_offset, encoded_source = _find_unique_pool_string(static, source_text)
+        except ValueError as exc:
+            skipped.append((source_text, str(exc)))
+            continue
+        try:
+            target_bytes = target_text.encode("ascii")
+        except UnicodeEncodeError:
+            skipped.append((source_text, "replacement is not ASCII"))
+            continue
+        if len(target_bytes) + 1 > len(encoded_source):
+            skipped.append((source_text,
+                            f"needs {len(target_bytes) + 1} bytes, slot has {len(encoded_source)}"))
+            continue
+
+        pool_bytes = static.content.pools[pool_index].data.getvalue()
+        pool_at = original.find(pool_bytes)
+        if pool_at < 0 or original.find(pool_bytes, pool_at + 1) >= 0:
+            skipped.append((source_text, "pool has no unique raw STATIC location"))
+            continue
+        absolute = pool_at + pool_offset
+        if original[absolute:absolute + len(encoded_source)] != encoded_source:
+            skipped.append((source_text, "decoded string and raw STATIC bytes disagree"))
+            continue
+        span = range(absolute, absolute + len(encoded_source))
+        if any(span.start < c.stop and c.start < span.stop for c in claimed):
+            skipped.append((source_text, "allocation overlaps another rename in this batch"))
+            continue
+        claimed.append(span)
+        replacement = target_bytes + b"\0" * (len(encoded_source) - len(target_bytes))
+        plan.append((absolute, encoded_source, replacement))
+
+    if not plan:
+        raise ValueError("No usable renames in this batch")
+
+    modified = bytearray(original)
+    for absolute, encoded_source, replacement in plan:
+        modified[absolute:absolute + len(encoded_source)] = replacement
+
+    allowed = set()
+    for absolute, encoded_source, _replacement in plan:
+        allowed.update(range(absolute, absolute + len(encoded_source)))
+    changed = {index for index, (left, right) in enumerate(zip(original, modified))
+               if left != right}
+    if not changed.issubset(allowed):
+        raise ValueError("Bytes outside the string allocations changed")
+
+    old_size, new_size = _publish(source, output, ovl, static, original, bytes(modified))
+
+    # A successful write is not verification: reload the staged family and read
+    # every replacement back out of the pools.
+    check, check_static = _load(output, game)
+    if _topology(check) != _topology(ovl):
+        raise ValueError(f"Topology changed: {_topology(ovl)} -> {_topology(check)}")
+    check_bytes = _decompressed_static(output, check, check_static)
+    for absolute, encoded_source, replacement in plan:
+        if check_bytes[absolute:absolute + len(replacement)] != replacement:
+            raise ValueError("A replacement did not survive the staged-family reload")
+
+    return BatchPatchReport(output, len(plan), len(changed), old_size, new_size,
+                            _topology(check), skipped)
