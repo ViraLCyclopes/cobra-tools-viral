@@ -156,6 +156,66 @@ def classify(names: list[str], donor: str, owned_ids: set[int]) -> list[tuple[st
     return [(n, fnv1_32(n) in owned_ids) for n in names]
 
 
+def build_registry_fragment(game_root: Path, donor: str, prefix: str,
+                            renamed_suffixes: list[str], game: str) -> tuple[str, int, int]:
+    """This mod's contribution to the audio registry.
+
+    ``wwisemetadatasoundbanks`` decides whether an event is ever POSTED - an
+    event missing from it is never fired, with no error anywhere. But it is ONE
+    GLOBAL FILE, so a mod must never ship its own whole copy: only one could win
+    and every other audio mod would go silent. Each mod emits this fragment and a
+    merge step folds them all into a single shared registry.
+
+    Returns (xml, evententry_rows, remapped_fnvs).
+    """
+    game_root = Path(game_root)
+    meta = (game_root / "Win64" / "ovldata" / "Content0" / "Audio" / "MetaData"
+            / "audiometadata.ovl")
+    if not meta.is_file():
+        raise FileNotFoundError(f"Stock registry not found: {meta}")
+
+    ovl = _open_ovl(meta, game)
+    previous = logging.root.manager.disable
+    with tempfile.TemporaryDirectory(prefix="vl_reg_") as tmp:
+        try:
+            logging.disable(logging.CRITICAL)
+            ovl.extract(tmp)
+        finally:
+            logging.disable(previous)
+        found = list(Path(tmp).glob("*.wmetasb"))
+        if not found:
+            raise FileNotFoundError("audiometadata.ovl held no .wmetasb")
+        registry = found[0].read_text(encoding="utf-8")
+
+    remap: dict[int, int] = {}
+    for suffix in renamed_suffixes:
+        for variant in (suffix, suffix + "_start", suffix + "_stop", suffix + "_oc",
+                        suffix + "_oc_start", suffix + "_oc_stop"):
+            remap[fnv1_32(f"{donor}_{variant}")] = fnv1_32(f"{prefix}_{variant}")
+
+    donor_bank = fnv1_32(f"{donor.lower()}_events")
+    match = re.search(r'(\t\t<bnkmetanew fnv="%d".*?</bnkmetanew>\n)' % donor_bank,
+                      registry, re.S)
+    if not match:
+        raise ValueError(f"{donor}_events is not declared in the stock registry")
+
+    def swap(mo):
+        value = int(mo.group(2))
+        return '%s="%d"' % (mo.group(1), remap.get(value, value))
+
+    block = re.sub(r'(event_fnv|stop_start_fnv|start_fnv)="(\d+)"', swap, match.group(1))
+    block = block.replace('fnv="%d"' % donor_bank,
+                          'fnv="%d"' % fnv1_32(f"{prefix.lower()}_events"), 1)
+    block += ('\t\t<bnkmetanew fnv="%d" flag="0" unk_2="0">\n'
+              '\t\t\t<type_name>SFX</type_name>\n'
+              '\t\t\t<events pool_type="4" />\n'
+              '\t\t</bnkmetanew>\n' % fnv1_32(f"{prefix.lower()}_media"))
+    rows = len(re.findall(r"<evententry", block))
+    changed = sum(1 for v in re.findall(r'event_fnv="(\d+)"', match.group(1))
+                  if int(v) in remap)
+    return block, rows, changed
+
+
 def rename_plan(names: list[str], donor: str, prefix: str) -> list[tuple[str, str]]:
     """(old, new) pairs, longest first.
 

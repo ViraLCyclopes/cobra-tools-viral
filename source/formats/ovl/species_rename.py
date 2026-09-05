@@ -90,10 +90,18 @@ the species goes silent. It keeps the donor's events on purpose."""
 
 
 def name_variants(old: str, new: str):
-	"""Cover the casings the data actually uses: lower for file names, capitalised
-	for the `Species$Clip` references inside the motiongraph."""
-	pairs = [(old.lower(), new.lower()), (old.capitalize(), new.capitalize()),
-			 (old.upper(), new.upper())]
+	"""Cover the casings the data actually uses: lower for file names, and the
+	token AS TYPED for the `Species$Clip` references and archive stems.
+
+	The as-typed pair is essential and easy to miss. Many species are CamelCase
+	(IndominusRex, SarcoViral, AllosaurusJW), and `str.capitalize()` LOWERCASES
+	every letter after the first - `IndominusRex` becomes `Indominusrex`, which
+	matches nothing. Without the literal pair a CamelCase rename silently renames
+	only the lowercase internals and leaves the stem and every CamelCase string
+	untouched.
+	"""
+	pairs = [(old, new), (old.lower(), new.lower()),
+			 (old.capitalize(), new.capitalize()), (old.upper(), new.upper())]
 	return list(dict.fromkeys(pairs))
 
 

@@ -915,7 +915,7 @@ class MainWindow(window.MainWindow):
 			"rename those strings to your own prefix and ship a bank that answers them.<br><br>"
 			"<b>Not every name is safe to rename.</b> Some resolve from SHARED banks used by "
 			"several species; renaming one orphans the sound in both directions and it goes "
-			"silent with no error. Scan first - unsafe names are unticked and cannot be ticked."
+			"silent with no error. Scan first - those are shown greyed out and cannot be ticked."
 		)
 		info.setWordWrap(True)
 		layout.addWidget(info)
@@ -944,7 +944,7 @@ class MainWindow(window.MainWindow):
 		layout.addWidget(scan_button)
 
 		self.audio_list = QtWidgets.QTreeWidget()
-		self.audio_list.setHeaderLabels(["Event name", "Becomes", "Owned by"])
+		self.audio_list.setHeaderLabels(["Event name in graph", "Your name for it", "Rename?"])
 		self.audio_list.setRootIsDecorated(False)
 		self.audio_list.setAlternatingRowColors(True)
 		layout.addWidget(self.audio_list, 1)
@@ -963,12 +963,17 @@ class MainWindow(window.MainWindow):
 		self.audio_apply.clicked.connect(self.apply_audio_rename)
 		layout.addWidget(self.audio_apply)
 
+		self.audio_fragment = QtWidgets.QPushButton(
+			"Write registry fragment (.wmetasb.add) for the ticked events")
+		self.audio_fragment.clicked.connect(self.write_audio_fragment)
+		layout.addWidget(self.audio_fragment)
+
 		note = QtWidgets.QLabel(
 			"Renaming the graph is only one of three pieces. The prefab still needs "
 			"<b>MotionGraphName</b> pointed at your renamed graph, <b>AudioCore.Name</b> left on "
 			"the DONOR (it prefixes engine-generated footstep and death events that live in "
-			"shared banks), and your events declared in the audio registry - an undeclared event "
-			"is never posted at all."
+			"shared banks), and the registry fragment below merged in - an undeclared event is "
+			"never posted at all."
 		)
 		note.setWordWrap(True)
 		layout.addWidget(note)
@@ -2054,8 +2059,9 @@ class MainWindow(window.MainWindow):
 				suffix = name[len(donor) + 1:]
 				item = QtWidgets.QTreeWidgetItem([
 					name,
-					("%s_%s" % (prefix, suffix)) if owned else "-",
-					("%s_events" % donor) if owned else "a SHARED bank - leave alone",
+					("%s_%s" % (prefix, suffix)) if owned else "stays as-is",
+					"Yes - your bank answers it" if owned
+					else "No - a SHARED bank owns this sound",
 				])
 				if owned:
 					item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
@@ -2103,6 +2109,39 @@ class MainWindow(window.MainWindow):
 			self.status_bar.showMessage(message, 15000)
 			logging.info(message)
 			self.census_guard("audio event rename", expect_added=0, expect_removed=0)
+		except Exception as exc:
+			self.showerror(str(exc))
+
+	def write_audio_fragment(self):
+		try:
+			donor = self.audio_donor.text().strip()
+			prefix = self.audio_prefix.text().strip()
+			suffixes = []
+			for index in range(self.audio_list.topLevelItemCount()):
+				item = self.audio_list.topLevelItem(index)
+				if not (item.flags() & QtCore.Qt.ItemIsUserCheckable):
+					continue
+				if item.checkState(0) != QtCore.Qt.Checked:
+					continue
+				suffixes.append(item.text(0)[len(donor) + 1:])
+			if not suffixes:
+				raise ValueError("Scan first, then tick the events your bank will answer")
+
+			game_root = Path(self.audio_game.text().strip())
+			xml, rows, remapped = audio_events.build_registry_fragment(
+				game_root, donor, prefix, suffixes, DEFAULT_GAME)
+
+			suggested = "%s.wmetasb.add" % prefix.lower()
+			chosen, _filter = QtWidgets.QFileDialog.getSaveFileName(
+				self, "Save registry fragment into your mod's Audio folder",
+				suggested, "Registry fragment (*.wmetasb.add)")
+			if not chosen:
+				return
+			Path(chosen).write_text(xml, encoding="utf-8", newline="")
+			message = ("Wrote %s - %d event rows, %d ids remapped. Put it in <Mod>/Audio/ "
+					   "and run the registry merge." % (Path(chosen).name, rows, remapped))
+			self.status_bar.showMessage(message, 20000)
+			logging.info(message)
 		except Exception as exc:
 			self.showerror(str(exc))
 
