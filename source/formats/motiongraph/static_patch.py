@@ -8,6 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from generated.formats.ovl import OvlFile
+from .clone import (NUM_FRAGMENTS_OFFSET, POOLS_END_OFFSET,
+                    UNCOMPRESSED_SIZE_OFFSET)
+from .surgical_growth import (_load_quiet, append_tail_pool_bytes,
+                              repoint_pool_end_fragments)
 
 
 DEFAULT_GAME = "Jurassic World Evolution 3"
@@ -323,3 +327,138 @@ def patch_string_slots(source: Path, output: Path, pairs, *,
 
     return BatchPatchReport(output, len(plan), len(changed), old_size, new_size,
                             _topology(check), skipped)
+
+
+@dataclass(frozen=True)
+class RelocateReport:
+    output: Path
+    relocated: int
+    fragments_repointed: int
+    pool_growth: int
+    skipped: list
+
+
+def relocate_strings(source: Path, output: Path, pairs, *,
+                     game: str = DEFAULT_GAME) -> RelocateReport:
+    """Rename strings that do NOT fit their existing slot, by ALLOCATING new ones.
+
+    `patch_string_slot` writes into the bytes the old string already occupies, so
+    a longer replacement has nowhere to go - which is why an audio prefix could
+    never be longer than the donor's (`Indoraptor` -> `Indocapi` fine,
+    `IndominusRex` -> `UltimasaurusCE` refused).
+
+    This lifts that limit the same way datastream growth does: append the new
+    string to the tail of a type-2 pool and repoint every fragment that referenced
+    the old one. The old string is left in place, abandoned - nothing is deleted
+    and no offsets shift.
+
+    Use it for the pairs `patch_string_slots` skipped as too long; short-enough
+    renames are cheaper as in-place patches.
+
+    LIMIT: allocation goes in the LAST type-2 pool, and on some archives that pool
+    is already full to its observed capacity. There is no page-creation support,
+    so such a file simply cannot take a longer name - that is reported, not
+    guessed around.
+    """
+    source, output = _require_staged_output(source, output)
+    ovl, static = _load_quiet(source, game)
+    ovs = static.content
+    fragments = ovs.fragments
+
+    old_uncompressed = int(static.uncompressed_size)
+    old_compressed = int(static.compressed_size)
+    old_pools_end = int(static.pools_end)
+    old_pool_sizes = tuple(int(pool.size) for pool in ovs.pools)
+    old_fragment_count = int(static.num_fragments)
+    static_index = ovl.archives.index(static)
+    old_reservation = int(ovl.archives_meta[static_index].unk_0)
+
+    allocations, skipped, repointed = [], [], 0
+    for source_text, target_text in pairs:
+        if source_text == target_text:
+            skipped.append((source_text, "source and target are identical"))
+            continue
+        needle = source_text.encode("ascii") + b"\0"
+        found = None
+        for index, pool in enumerate(ovs.pools):
+            if int(pool.type) != 2:
+                continue
+            blob = pool.data.getvalue()
+            at = blob.find(needle)
+            while at != -1:
+                if at == 0 or blob[at - 1] == 0:
+                    found = (index, at)
+                    break
+                at = blob.find(needle, at + 1)
+            if found:
+                break
+        if found is None:
+            skipped.append((source_text, "not found in any string pool"))
+            continue
+        old_pool, old_offset = found
+        mask = ((fragments["struct_pool"] == old_pool)
+                & (fragments["struct_offset"] == old_offset))
+        count = int(mask.sum())
+        if not count:
+            skipped.append((source_text, "no fragment references it"))
+            continue
+        try:
+            allocation = append_tail_pool_bytes(
+                ovl.pools, ovs.pools, 2, target_text.encode("ascii") + b"\0", alignment=16)
+        except ValueError as error:
+            skipped.append((source_text, str(error)))
+            continue
+        repoint_pool_end_fragments(fragments, allocation.local_pool,
+                                   allocation.old_size, allocation.new_size)
+        allocations.append(allocation)
+        # recompute the mask: repoint_pool_end_fragments may have moved records
+        mask = ((fragments["struct_pool"] == old_pool)
+                & (fragments["struct_offset"] == old_offset))
+        fragments["struct_pool"][mask] = allocation.local_pool
+        fragments["struct_offset"][mask] = allocation.offset
+        repointed += int(mask.sum())
+
+    if not allocations:
+        raise ValueError("Nothing could be relocated: " + "; ".join(
+            f"{name}: {why}" for name, why in skipped) or "no pairs given")
+
+    ovs.write_pools()
+    uncompressed = ovs.write_archive()
+    pool_growth = sum(a.new_size - a.old_size for a in allocations)
+    expected = old_uncompressed + pool_growth
+    if len(uncompressed) != expected:
+        raise ValueError(f"Unexpected STATIC growth: {len(uncompressed)} vs {expected}")
+    if int(static.num_fragments) != old_fragment_count:
+        raise ValueError("Fragment count changed; a string relocation must not add any")
+    expected_sizes = list(old_pool_sizes)
+    for a in allocations:
+        expected_sizes[a.local_pool] = a.new_size
+    if tuple(int(pool.size) for pool in ovs.pools) != tuple(expected_sizes):
+        raise ValueError("An unrelated pool changed size while relocating strings")
+
+    _, new_compressed, compressed = ovs.compress(uncompressed, True)
+    source_bytes = source.read_bytes()
+    header_size = len(source_bytes) - old_compressed
+    meta_offset = header_size - len(ovl.archives_meta) * 8 + static_index * 8
+    result = bytearray(source_bytes[:header_size])
+    result.extend(compressed)
+    head = int(static.io_start)
+    struct.pack_into("<I", result, head + NUM_FRAGMENTS_OFFSET, static.num_fragments)
+    struct.pack_into("<I", result, head + COMPRESSED_SIZE_OFFSET, new_compressed)
+    struct.pack_into("<Q", result, head + UNCOMPRESSED_SIZE_OFFSET, expected)
+    struct.pack_into("<I", result, head + POOLS_END_OFFSET, old_pools_end + pool_growth)
+    struct.pack_into("<I", result, meta_offset, old_reservation + pool_growth)
+    output.write_bytes(result)
+
+    # a written file is not a verified one: every new string must be readable back
+    check_ovl, check_static = _load_quiet(output, game)
+    pools = check_static.content.pools
+    for _source_text, target_text in pairs:
+        if any(name == _source_text for name, _ in skipped):
+            continue
+        needle = target_text.encode("ascii") + b"\0"
+        if not any(int(p.type) == 2 and needle in p.data.getvalue() for p in pools):
+            raise ValueError(f"Reloaded archive has no string {target_text!r}")
+    logging.info("Relocated %d strings, repointed %d fragments, +%d bytes",
+                 len(allocations), repointed, pool_growth)
+    return RelocateReport(output, len(allocations), repointed, pool_growth, skipped)

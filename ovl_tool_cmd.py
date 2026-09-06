@@ -14,6 +14,7 @@ Subcommands:
   motiongraph-capacity - audit reusable allocation slack and dormant topology
   motiongraph-census   - count decoded graph objects; diff two builds for orphans
   motiongraph-chooser  - list/grow/re-weight a random animation chooser
+  motiongraph-decision - list decision routes, add a result, add a NEW STATE
   motiongraph-diff     - capture one build's edits as a replayable patch plan
   motiongraph-grow-null-prefix - experimental fixed-pool logical array growth
   motiongraph-retarget-clip - repoint references to an existing same-pool clip string
@@ -650,6 +651,99 @@ def cmd_motiongraph_chooser(args: argparse.Namespace) -> None:
                   f"  {clip['share']:6.1%}")
 
 
+def cmd_motiongraph_decision(args: argparse.Namespace) -> None:
+    """List decision-layer choosers, add a result, or add a whole new state.
+
+    `StandPreen`/`StandPreen02` look like they are not chooser-driven - each is a
+    lone AnimationActivity the decision layer routes to - but both are results of
+    a RandomChoiceEndDecisionScope whose `children` is an ArrayPointer. Growing it
+    is how you add a route, and `--add-state` is how you get somewhere to route TO.
+
+    Both are game-verified (UltimasaurusCE 2026-09-06, state count 196 -> 197).
+    """
+    from pathlib import Path
+    from source.formats.motiongraph.decision_growth import (
+        add_state, grow_decision_chooser, inbound_count, list_decision_choosers,
+        list_states)
+
+    game = resolve_game_label(args.game)
+    source = Path(args.ovl).resolve()
+    ensure_exists(str(source), "file")
+
+    if args.list_states:
+        try:
+            rows = list_states(source, args.name, game)
+        except Exception as exc:
+            die(f"could not read states: {exc}")
+        for row in rows:
+            print(f"  [{row['index']:3d}] {row['label']:32s} "
+                  f"activities {row['activities']:2d}  transitions {row['transitions']:2d}"
+                  f"  at {row['at'][0]}:{row['at'][1]}")
+        return
+
+    if args.add_state is None and args.route_to is None:
+        try:
+            rows = list_decision_choosers(source, args.name, game)
+        except Exception as exc:
+            die(f"could not read decision choosers: {exc}")
+        for row in rows:
+            print(f"chooser {row['pool']}:{row['offset']}  {row['num_children']} results  "
+                  f"array {row['children_at'][0]}:{row['children_at'][1]}")
+            for result in row["results"]:
+                node = result["node_at"]
+                shared = inbound_count(source, node[0], node[1], game)
+                print(f"    [{result['ordinal']}] STATE[{result['state']}] "
+                      f"{result['label']:24s} weight {result['weight']:4d}"
+                      f"  {result['share']:5.1f}%   node {node[0]}:{node[1]}"
+                      + ("   SHARED - do not retarget in place" if shared > 1 else ""))
+        if not rows:
+            print("no decision choosers found")
+        return
+
+    if not args.output:
+        die("--add-state and --route-to write a file; pass -o/--output (a staged family)")
+    output = Path(args.output).resolve()
+
+    if args.add_state is not None:
+        try:
+            report = add_state(source, output, args.add_state, args.name, game)
+        except Exception as exc:
+            die(f"could not add a state: {exc}")
+        logging.success(f"states {report.old_count} -> {report.new_count}; "
+                        f"new STATE[{report.new_state_index}] twinned on "
+                        f"[{report.twin_state}] at {report.new_state_at[0]}:"
+                        f"{report.new_state_at[1]}; +{report.pool_growth} bytes, "
+                        f"+{report.added_fragments} fragments, "
+                        f"{report.moved_end_sentinels} sentinels moved")
+        logging.warning("The new state has NO inbound edge yet - it is dormant until "
+                        "you --route-to it")
+        source = output
+
+    if args.route_to is not None:
+        if args.chooser is None:
+            die("--route-to needs --chooser POOL:OFFSET (see the plain listing)")
+        try:
+            pool_text, offset_text = str(args.chooser).split(":")
+            node_pool, node_offset = int(pool_text), int(offset_text)
+        except ValueError:
+            die(f"--chooser must look like POOL:OFFSET, got {args.chooser!r}")
+        if source != output and not output.is_file():
+            die("stage the complete OVL family at --output first")
+        try:
+            report = grow_decision_chooser(
+                source, output, node_pool, node_offset, args.route_to,
+                weight=args.weight if args.weight else 1, name=args.name, game=game)
+        except Exception as exc:
+            die(f"could not grow the decision chooser: {exc}")
+        logging.success(f"results {report.old_results} -> {report.new_results} "
+                        f"-> STATE[{report.target_state}] at weight {report.weight}; "
+                        f"+{report.pool_growth} bytes, +{report.added_fragments} fragments, "
+                        f"{report.moved_end_sentinels} sentinels moved")
+
+    logging.warning("Cobra reload is not proof - verify with motiongraph-census "
+                    "--against and then IN GAME")
+
+
 def cmd_motiongraph_census(args: argparse.Namespace) -> None:
     """Census decoded motiongraph objects, optionally diffing two builds.
 
@@ -1092,6 +1186,34 @@ def build_parser() -> argparse.ArgumentParser:
         choices=game_vals if game_vals else None,
     )
     p_mgh.set_defaults(func=cmd_motiongraph_chooser)
+
+    # motiongraph-decision
+    p_mgn = sub.add_parser(
+        "motiongraph-decision",
+        help="List decision routes, add a result, or add a NEW STATE (raises the count).",
+    )
+    p_mgn.add_argument("ovl", help="Source OVL; never modified unless -o is given.")
+    p_mgn.add_argument(
+        "--list-states", action="store_true",
+        help="List every registered state with its index, label and address.",
+    )
+    p_mgn.add_argument("--chooser", help="Target chooser as POOL:OFFSET, from the listing.")
+    p_mgn.add_argument(
+        "--add-state", type=int, metavar="TWIN",
+        help="Register a new state twinned on this state index. Dormant until routed to.",
+    )
+    p_mgn.add_argument(
+        "--route-to", type=int, metavar="STATE",
+        help="Add a chooser result pointing at this state index. Needs --chooser.",
+    )
+    p_mgn.add_argument("--weight", type=int, help="Weight for the added result (default 1).")
+    p_mgn.add_argument("-o", "--output", help="Staged same-named OVL to write.")
+    p_mgn.add_argument("--name", help="Internal .motiongraph name; auto-detected.")
+    p_mgn.add_argument(
+        "-g", "--game", default="Jurassic World Evolution 3",
+        choices=game_vals if game_vals else None,
+    )
+    p_mgn.set_defaults(func=cmd_motiongraph_decision)
 
     # motiongraph-diff
     p_mgd = sub.add_parser(

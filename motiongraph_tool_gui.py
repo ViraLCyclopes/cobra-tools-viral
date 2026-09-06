@@ -5,7 +5,9 @@ from __future__ import annotations
 import math
 import logging
 import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from gui import GuiOptions, startup, widgets
@@ -32,6 +34,13 @@ from source.formats.motiongraph.capacity import (
 	diff_census,
 	render_capacity_markdown,
 )
+from source.formats.motiongraph.decision_growth import (
+	add_state,
+	grow_decision_chooser,
+	inbound_count,
+	list_decision_choosers,
+	list_states,
+)
 from source.formats.motiongraph.chooser_growth import (
 	grow_random_animation_chooser,
 	list_choosers,
@@ -48,8 +57,13 @@ from source.formats.motiongraph.report import (
 	build_state_report,
 )
 from source.formats.motiongraph.static_patch import (patch_string_slot, patch_string_slots,
+															 relocate_strings,
                                                      repoint_existing_string)
 from source.formats.motiongraph import audio_events
+from source.formats.motiongraph.datastream_growth import (
+	activities_with_stream, curve_type_for, describe_activity, grow_data_stream,
+	is_held, list_activities, read_data_stream_curve, set_curve_everywhere,
+	set_data_stream_curve)
 
 
 def describe_motiongraph_field(path: str, kind: str = "") -> str:
@@ -342,6 +356,205 @@ class DecisionNode(QtWidgets.QGraphicsRectItem):
 		super().mouseDoubleClickEvent(event)
 
 
+class CurveEditor(QtWidgets.QWidget):
+	"""Click-and-drag editor for a datastream's on/off curve.
+
+	x is normalised clip time 0..1, y the signal value. Keys use
+	SubCurveType.Constant, which holds its value until the next key, so the curve
+	is drawn as a STEP - drawing it as a slope would misrepresent when the effect
+	actually switches.
+	"""
+
+	changed = QtCore.pyqtSignal()
+
+	MARGIN = 34
+	HANDLE = 9           # drawn size
+	GRAB = 16            # click tolerance - generous, or a near-miss ADDS a point
+
+	def __init__(self, parent=None):
+		super().__init__(parent)
+		self.points = [(0.0, 0.0), (0.35, 1.0), (0.75, 0.0), (1.0, 0.0)]
+		self.snap = True
+		self._drag = None
+		# undo history: snapshots pushed BEFORE each mutation, so one Ctrl+Z
+		# reverts a whole drag rather than each mouse-move sample
+		self._undo = []
+		self._redo = []
+		self.setMinimumHeight(190)
+		self.setMouseTracking(True)
+		self.setFocusPolicy(QtCore.Qt.StrongFocus)
+		self.setToolTip(
+			"Click a gap to add a key, drag a key to move it, right-click one to delete.\n"
+			"The first key must stay at x=0. Snap keeps y at exactly 0 or 1.")
+
+	def _push_undo(self):
+		self._undo.append(list(self.points))
+		del self._undo[:-64]
+		self._redo.clear()
+
+	def undo(self):
+		if not self._undo:
+			return False
+		self._redo.append(list(self.points))
+		self.points = self._undo.pop()
+		self.update()
+		self.changed.emit()
+		return True
+
+	def redo(self):
+		if not self._redo:
+			return False
+		self._undo.append(list(self.points))
+		self.points = self._redo.pop()
+		self.update()
+		self.changed.emit()
+		return True
+
+	def keyPressEvent(self, event):
+		if event.matches(QtGui.QKeySequence.Undo):
+			self.undo()
+		elif event.matches(QtGui.QKeySequence.Redo) or (
+				event.key() == QtCore.Qt.Key_Y and event.modifiers() & QtCore.Qt.ControlModifier):
+			self.redo()
+		else:
+			super().keyPressEvent(event)
+
+	def set_points(self, points, record=True):
+		if record:
+			self._push_undo()
+		self.points = [(float(x), float(y)) for x, y in points] or [(0.0, 0.0), (1.0, 0.0)]
+		self.update()
+		self.changed.emit()
+
+	def _plot_rect(self):
+		return QtCore.QRectF(self.MARGIN, 12,
+							 max(10, self.width() - self.MARGIN - 18),
+							 max(10, self.height() - self.MARGIN - 12))
+
+	def _to_px(self, x, y):
+		r = self._plot_rect()
+		return QtCore.QPointF(r.left() + x * r.width(), r.bottom() - y * r.height())
+
+	def _from_px(self, pos):
+		r = self._plot_rect()
+		x = (pos.x() - r.left()) / r.width() if r.width() else 0.0
+		y = (r.bottom() - pos.y()) / r.height() if r.height() else 0.0
+		return min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0)
+
+	def paintEvent(self, _event):
+		painter = QtGui.QPainter(self)
+		painter.setRenderHint(QtGui.QPainter.Antialiasing)
+		r = self._plot_rect()
+		text_colour = self.palette().color(QtGui.QPalette.WindowText)
+
+		grid = QtGui.QColor(text_colour)
+		grid.setAlpha(46)
+		painter.setPen(QtGui.QPen(grid, 1))
+		for step in range(11):
+			x = r.left() + r.width() * step / 10.0
+			painter.drawLine(QtCore.QPointF(x, r.top()), QtCore.QPointF(x, r.bottom()))
+		for value in (0.0, 0.5, 1.0):
+			y = r.bottom() - r.height() * value
+			painter.drawLine(QtCore.QPointF(r.left(), y), QtCore.QPointF(r.right(), y))
+
+		painter.setPen(QtGui.QPen(text_colour, 1))
+		painter.drawRect(r)
+		font = painter.font()
+		font.setPointSizeF(max(7.0, font.pointSizeF() - 1.5))
+		painter.setFont(font)
+		painter.drawText(QtCore.QRectF(4, r.bottom() - 9, self.MARGIN - 8, 16),
+						 QtCore.Qt.AlignRight, "off 0")
+		painter.drawText(QtCore.QRectF(4, r.top() - 7, self.MARGIN - 8, 16),
+						 QtCore.Qt.AlignRight, "on 1")
+		painter.drawText(QtCore.QRectF(r.left() - 12, r.bottom() + 4, 40, 16),
+						 QtCore.Qt.AlignLeft, "start")
+		painter.drawText(QtCore.QRectF(r.right() - 30, r.bottom() + 4, 40, 16),
+						 QtCore.Qt.AlignRight, "end")
+
+		if not self.points:
+			return
+		accent = QtGui.QColor("#C6402A")
+		painter.setPen(QtGui.QPen(accent, 2))
+		path = QtGui.QPainterPath(self._to_px(*self.points[0]))
+		for index in range(1, len(self.points)):
+			previous, current = self.points[index - 1], self.points[index]
+			corner = self._to_px(current[0], previous[1])
+			path.lineTo(corner)
+			path.lineTo(self._to_px(*current))
+		last = self.points[-1]
+		if last[0] < 1.0:
+			path.lineTo(self._to_px(1.0, last[1]))
+		painter.drawPath(path)
+
+		painter.setBrush(QtGui.QBrush(accent))
+		for x, y in self.points:
+			painter.drawRect(QtCore.QRectF(self._to_px(x, y).x() - self.HANDLE / 2,
+										   self._to_px(x, y).y() - self.HANDLE / 2,
+										   self.HANDLE, self.HANDLE))
+
+	def _hit(self, pos):
+		"""Index of the nearest key within GRAB pixels, else None.
+
+		Nearest rather than first-within-range: keys can sit close together (an
+		off key right after an on key), and picking the first match grabs the
+		wrong one.
+		"""
+		best, best_d = None, None
+		for index, (x, y) in enumerate(self.points):
+			delta = self._to_px(x, y) - pos
+			d = (delta.x() ** 2 + delta.y() ** 2) ** 0.5
+			if d <= self.GRAB and (best_d is None or d < best_d):
+				best, best_d = index, d
+		return best
+
+	def mousePressEvent(self, event):
+		index = self._hit(event.pos())
+		if event.button() == QtCore.Qt.RightButton:
+			# the first key anchors x=0; a curve also needs two points to exist
+			if index is not None and index > 0 and len(self.points) > 2:
+				self._push_undo()
+				del self.points[index]
+				self.update()
+				self.changed.emit()
+			return
+		if event.button() != QtCore.Qt.LeftButton:
+			return
+		if index is None:
+			x, y = self._from_px(event.pos())
+			if self.snap:
+				y = 1.0 if y >= 0.5 else 0.0
+			self._push_undo()
+			self.points.append((x, y))
+			self.points.sort(key=lambda point: point[0])
+			index = self.points.index((x, y))
+			self.changed.emit()
+		else:
+			self._push_undo()
+		self._drag = index
+		self.update()
+
+	def mouseMoveEvent(self, event):
+		if self._drag is None:
+			self.setCursor(QtCore.Qt.SizeAllCursor if self._hit(event.pos()) is not None
+						   else QtCore.Qt.CrossCursor)
+			return
+		x, y = self._from_px(event.pos())
+		if self.snap:
+			y = 1.0 if y >= 0.5 else 0.0
+		if self._drag == 0:
+			x = 0.0                                  # the first key must stay at the clip start
+		else:
+			x = max(x, self.points[self._drag - 1][0])
+		if self._drag < len(self.points) - 1:
+			x = min(x, self.points[self._drag + 1][0])
+		self.points[self._drag] = (x, y)
+		self.update()
+		self.changed.emit()
+
+	def mouseReleaseEvent(self, _event):
+		self._drag = None
+
+
 class MainWindow(window.MainWindow):
 	def __init__(self, opts: GuiOptions, initial_path: str = ""):
 		self.body = QtWidgets.QWidget()
@@ -396,10 +609,12 @@ class MainWindow(window.MainWindow):
 		self._build_fields_tab()
 		self._build_clone_tab()
 		self._build_chooser_tab()
+		self._build_decision_tab()
 		self._build_retarget_tab()
 		self._build_rename_repair_tab()
 		self._build_capacity_tab()
 		self._build_audio_tab()
+		self._build_effects_tab()
 		self._build_stage_tab()
 
 		# The body was initially inserted directly by MainWindow. Reparent it into
@@ -845,6 +1060,163 @@ class MainWindow(window.MainWindow):
 		layout.addLayout(form)
 		self.tabs.addTab(page, "Choosers")
 
+	def _build_decision_tab(self):
+		page = QtWidgets.QWidget()
+		layout = QtWidgets.QVBoxLayout(page)
+		info = QtWidgets.QLabel(
+			"Some clips look like they are NOT chooser-driven - StandPreen / StandPreen02 are each "
+			"a lone AnimationActivity the decision layer routes to - but they ARE, at the "
+			"<b>decision</b> layer. Both are results of a <b>RandomChoiceEndDecisionScope</b> whose "
+			"<tt>children</tt> is an ArrayPointer, so it relocates and grows like any other array. "
+			"<b>Add a state</b> gives you somewhere to route to; <b>add a result</b> is the route."
+		)
+		info.setWordWrap(True)
+		layout.addWidget(info)
+		note = QtWidgets.QLabel(
+			"Both raise topology. Adding a state RELOCATES the whole state array and bumps the "
+			"state count - game-verified 196 -> 197, but re-load the staged file and check the "
+			"census. A new state is DORMANT until something routes to it. Nodes marked SHARED are "
+			"referenced by more than one place (often a transition-layer decision block as well as "
+			"this chooser), which is why a result always gets its own new StateOutput node rather "
+			"than reusing one."
+		)
+		note.setWordWrap(True)
+		note.setStyleSheet("color: #ffe075; padding: 4px 0;")
+		layout.addWidget(note)
+
+		button_row = QtWidgets.QHBoxLayout()
+		refresh = QtWidgets.QPushButton("List decision routes")
+		refresh.clicked.connect(self.refresh_decisions)
+		button_row.addWidget(refresh)
+		button_row.addStretch(1)
+		layout.addLayout(button_row)
+
+		self.decision_tree = QtWidgets.QTreeWidget()
+		self.decision_tree.setHeaderLabels(["Chooser / result", "Weight", "Share", "Node"])
+		self.decision_tree.setColumnWidth(0, 340)
+		self.decision_tree.itemSelectionChanged.connect(self.decision_selected)
+		layout.addWidget(self.decision_tree, 1)
+
+		form = QtWidgets.QFormLayout()
+		self.decision_target = QtWidgets.QLabel("No chooser selected")
+		form.addRow("Selected", self.decision_target)
+		self.decision_route_state = QtWidgets.QSpinBox()
+		self.decision_route_state.setRange(0, 9999)
+		form.addRow("Route to state index", self.decision_route_state)
+		self.decision_route_weight = QtWidgets.QSpinBox()
+		self.decision_route_weight.setRange(1, 100000)
+		self.decision_route_weight.setValue(1)
+		form.addRow("Its weight", self.decision_route_weight)
+		route_button = QtWidgets.QPushButton("Add result to chooser in staged family")
+		route_button.clicked.connect(self.apply_decision_route)
+		form.addRow(route_button)
+
+		line = QtWidgets.QFrame()
+		line.setFrameShape(QtWidgets.QFrame.HLine)
+		form.addRow(line)
+
+		self.decision_twin_state = QtWidgets.QSpinBox()
+		self.decision_twin_state.setRange(0, 9999)
+		form.addRow("New state twinned on", self.decision_twin_state)
+		state_button = QtWidgets.QPushButton("Add new state to staged family")
+		state_button.clicked.connect(self.apply_add_state)
+		form.addRow(state_button)
+		layout.addLayout(form)
+		self.tabs.addTab(page, "Decision Routes")
+
+	def refresh_decisions(self):
+		try:
+			source = self.source_path()
+			rows = list_decision_choosers(source, self.name_edit.text().strip() or None,
+										  DEFAULT_GAME)
+		except Exception as exc:
+			self.showerror(str(exc))
+			return
+		self.decision_tree.clear()
+		for row in rows:
+			parent = QtWidgets.QTreeWidgetItem([
+				f"chooser {row['pool']}:{row['offset']}", "", "",
+				f"{row['num_children']} results  "
+				f"array {row['children_at'][0]}:{row['children_at'][1]}"])
+			parent.setData(0, QtCore.Qt.UserRole, (row["pool"], row["offset"]))
+			for result in row["results"]:
+				node = result["node_at"]
+				try:
+					shared = inbound_count(source, node[0], node[1], DEFAULT_GAME) > 1
+				except Exception:
+					shared = False
+				parent.addChild(QtWidgets.QTreeWidgetItem([
+					f"STATE[{result['state']}] {result['label']}",
+					str(result["weight"]), f"{result['share']:.1f}%",
+					f"{node[0]}:{node[1]}" + ("  SHARED" if shared else "")]))
+			self.decision_tree.addTopLevelItem(parent)
+			parent.setExpanded(True)
+		self.status_bar.showMessage(f"Listed {len(rows)} decision chooser(s)", 8000)
+		if not rows:
+			logging.info("No RandomChoiceEndDecisionScope nodes in this graph")
+
+	def decision_selected(self):
+		items = self.decision_tree.selectedItems()
+		if not items:
+			return
+		item = items[0]
+		if item.parent() is not None:
+			item = item.parent()
+		data = item.data(0, QtCore.Qt.UserRole)
+		if data:
+			self.decision_target.setText(f"chooser {data[0]}:{data[1]}")
+
+	def _selected_decision(self):
+		items = self.decision_tree.selectedItems()
+		if not items:
+			raise ValueError("Select a chooser in the list first")
+		item = items[0]
+		if item.parent() is not None:
+			item = item.parent()
+		data = item.data(0, QtCore.Qt.UserRole)
+		if not data:
+			raise ValueError("Select a chooser row, not a result row")
+		return data
+
+	def apply_decision_route(self):
+		try:
+			pool, offset = self._selected_decision()
+			state = self.decision_route_state.value()
+			weight = self.decision_route_weight.value()
+			report = grow_decision_chooser(
+				self.source_path(), self.output_path(), pool, offset, state,
+				weight=weight, name=self.name_edit.text().strip() or None, game=DEFAULT_GAME)
+			self.status_bar.showMessage(
+				f"Chooser {pool}:{offset} now has {report.new_results} results", 12000)
+			logging.info(f"Decision route added: {report}")
+			# A new result adds a node, a Something and a ResultParam, and orphans
+			# the donor children array - so objects rise and one may disappear.
+			self.census_guard("decision route growth", expect_added=None, expect_removed=None)
+			self.showerror(
+				"Decision growth is TOPOLOGY GROWTH, and cobra reload is not proof of engine "
+				"acceptance. Check the census line in the log, then test IN GAME."
+			)
+		except Exception as exc:
+			self.showerror(str(exc))
+
+	def apply_add_state(self):
+		try:
+			twin = self.decision_twin_state.value()
+			report = add_state(self.source_path(), self.output_path(), twin,
+							   name=self.name_edit.text().strip() or None, game=DEFAULT_GAME)
+			self.status_bar.showMessage(
+				f"States {report.old_count} -> {report.new_count}; "
+				f"new STATE[{report.new_state_index}]", 15000)
+			logging.info(f"New state added: {report}")
+			self.census_guard("new state", expect_added=None, expect_removed=None)
+			self.showerror(
+				f"STATE[{report.new_state_index}] exists but is DORMANT - nothing routes to it "
+				f"yet. Add a chooser result pointing at index {report.new_state_index}, then "
+				f"test IN GAME. Cobra reload is not proof of engine acceptance."
+			)
+		except Exception as exc:
+			self.showerror(str(exc))
+
 	def _build_capacity_tab(self):
 		page = QtWidgets.QWidget()
 		layout = QtWidgets.QVBoxLayout(page)
@@ -933,13 +1305,46 @@ class MainWindow(window.MainWindow):
 		self.audio_donor = QtWidgets.QLineEdit()
 		self.audio_donor.setPlaceholderText("Donor species, e.g. Indoraptor")
 		self.audio_prefix = QtWidgets.QLineEdit()
-		self.audio_prefix.setPlaceholderText("Your prefix, e.g. Indocapi - no longer than the donor")
+		self.audio_prefix.setPlaceholderText("Your prefix, e.g. Indocapi - may be longer than the donor")
 		form.addRow("Game folder", game_holder)
 		form.addRow("Donor species", self.audio_donor)
 		form.addRow("New prefix", self.audio_prefix)
 		layout.addLayout(form)
 
-		scan_button = QtWidgets.QPushButton("Scan graph for audio events")
+		build_box = QtWidgets.QGroupBox("1. Build this species' own sound banks")
+		build_form = QtWidgets.QFormLayout(build_box)
+		self.audio_soundmod = QtWidgets.QLineEdit()
+		self.audio_soundmod.setPlaceholderText(
+			"optional: a replacement-sound mod's <Donor>_media.ovl - blank uses stock audio")
+		sm_row = QtWidgets.QHBoxLayout()
+		sm_row.addWidget(self.audio_soundmod, 1)
+		sm_browse = QtWidgets.QPushButton("Browse...")
+		sm_browse.clicked.connect(self.browse_audio_soundmod)
+		sm_row.addWidget(sm_browse)
+		sm_holder = QtWidgets.QWidget(); sm_holder.setLayout(sm_row)
+
+		self.audio_out = QtWidgets.QLineEdit()
+		self.audio_out.setPlaceholderText("output folder for the built .bnk files")
+		out_row = QtWidgets.QHBoxLayout()
+		out_row.addWidget(self.audio_out, 1)
+		out_browse = QtWidgets.QPushButton("Browse...")
+		out_browse.clicked.connect(self.browse_audio_out)
+		out_row.addWidget(out_browse)
+		out_holder = QtWidgets.QWidget(); out_holder.setLayout(out_row)
+
+		build_form.addRow("Replacement sound mod", sm_holder)
+		build_form.addRow("Output folder", out_holder)
+		self.audio_build = QtWidgets.QPushButton("Build species audio banks")
+		self.audio_build.setToolTip(
+			"Re-IDs the donor's banks onto a new prefix so this species has its own "
+			"audio. A replacement-sound mod ships the SAME ids as stock, so installing "
+			"one changes every animal of the donor species; this makes a scoped, "
+			"non-replacement mod instead.")
+		self.audio_build.clicked.connect(self.build_species_audio)
+		build_form.addRow(self.audio_build)
+		layout.addWidget(build_box)
+
+		scan_button = QtWidgets.QPushButton("2. Scan graph for audio events")
 		scan_button.clicked.connect(self.scan_audio_events)
 		layout.addWidget(scan_button)
 
@@ -978,6 +1383,260 @@ class MainWindow(window.MainWindow):
 		note.setWordWrap(True)
 		layout.addWidget(note)
 		self.tabs.addTab(page, "Audio Events")
+
+	def _build_effects_tab(self):
+		page = QtWidgets.QWidget()
+		layout = QtWidgets.QVBoxLayout(page)
+		info = QtWidgets.QLabel(
+			"An activity fires effects through its <b>datastreams</b>. Add one here and the "
+			"animation can switch a particle on - the prefab entity must be named EXACTLY the "
+			"same, because that name is the only link between the two.<br><br>"
+			"<b>The curve is the on/off switch.</b> Every stock VFX curve goes on and never "
+			"goes off, which is fine for a one-shot dust puff and wrong for a continuous "
+			"emitter like fire - it would burn forever. Give it a key back down to 0."
+		)
+		info.setWordWrap(True)
+		layout.addWidget(info)
+
+		pick_row = QtWidgets.QHBoxLayout()
+		self.effect_activity = QtWidgets.QComboBox()
+		self.effect_activity.setEditable(True)
+		self.effect_activity.setMinimumWidth(260)
+		scan = QtWidgets.QPushButton("List activities")
+		scan.clicked.connect(self.scan_effect_activities)
+		show = QtWidgets.QPushButton("Show its datastreams")
+		show.clicked.connect(self.show_effect_streams)
+		pick_row.addWidget(QtWidgets.QLabel("Activity"))
+		pick_row.addWidget(self.effect_activity, 1)
+		pick_row.addWidget(scan)
+		pick_row.addWidget(show)
+		layout.addLayout(pick_row)
+
+		self.effect_list = QtWidgets.QTreeWidget()
+		self.effect_list.setHeaderLabels(["Datastream", "Type", "curve_type"])
+		self.effect_list.setRootIsDecorated(False)
+		self.effect_list.setAlternatingRowColors(True)
+		self.effect_list.setMaximumHeight(130)
+		self.effect_list.itemSelectionChanged.connect(self.load_effect_curve)
+		layout.addWidget(self.effect_list)
+		self.effect_held = QtWidgets.QLabel()
+		self.effect_held.setWordWrap(True)
+		layout.addWidget(self.effect_held)
+
+		form = QtWidgets.QFormLayout()
+		self.effect_name = QtWidgets.QLineEdit()
+		self.effect_name.setPlaceholderText("VFX_Roar_Fire - and name the prefab entity this too")
+		self.effect_type = QtWidgets.QComboBox()
+		self.effect_type.setEditable(True)
+		self.effect_type.addItems(["VFXEnable", "VFXToggle", "AudioEvent",
+								   "AudioLoopingEvent", "AudioRTPC", "General"])
+		form.addRow("Datastream name", self.effect_name)
+		form.addRow("Type", self.effect_type)
+		layout.addLayout(form)
+
+		self.curve_editor = CurveEditor()
+		self.effects_dirty = False
+		self.curve_editor.changed.connect(self._mark_effects_dirty)
+		layout.addWidget(self.curve_editor, 1)
+		self.curve_readout = QtWidgets.QLabel()
+		self.curve_readout.setWordWrap(True)
+		self.curve_editor.changed.connect(self.update_curve_readout)
+		layout.addWidget(self.curve_readout)
+
+		preset_row = QtWidgets.QHBoxLayout()
+		snap = QtWidgets.QCheckBox("Snap to on/off")
+		snap.setChecked(True)
+		snap.toggled.connect(lambda on: setattr(self.curve_editor, "snap", on))
+		preset_row.addWidget(snap)
+		burst = QtWidgets.QPushButton("Burst preset")
+		burst.setToolTip("What vanilla ships: on part-way through and never off. "
+						 "Correct ONLY for one-shot effects.")
+		burst.clicked.connect(
+			lambda: self.curve_editor.set_points([(0.0, 0.0), (0.35, 1.0), (1.0, 1.0)]))
+		window_preset = QtWidgets.QPushButton("On/off window preset")
+		window_preset.setToolTip("On, then explicitly off again - use for continuous emitters.")
+		window_preset.clicked.connect(
+			lambda: self.curve_editor.set_points(
+				[(0.0, 0.0), (0.35, 1.0), (0.75, 0.0), (1.0, 0.0)]))
+		preset_row.addWidget(burst)
+		preset_row.addWidget(window_preset)
+		preset_row.addStretch(1)
+		layout.addLayout(preset_row)
+
+		action_row = QtWidgets.QHBoxLayout()
+		add_button = QtWidgets.QPushButton("Add datastream to staged family")
+		add_button.clicked.connect(self.apply_effect_growth)
+		set_button = QtWidgets.QPushButton("Write curve to staged family")
+		set_button.clicked.connect(self.apply_effect_curve)
+		all_button = QtWidgets.QPushButton("Write to ALL activities firing this name")
+		all_button.setToolTip("Applies this curve and type to every activity that already "
+							  "fires this datastream, chaining the rewrites for you.")
+		all_button.clicked.connect(self.apply_effect_curve_everywhere)
+		usage_button = QtWidgets.QPushButton("Where is it used?")
+		usage_button.clicked.connect(self.show_effect_usage)
+		action_row.addWidget(add_button)
+		action_row.addWidget(set_button)
+		action_row.addWidget(all_button)
+		action_row.addWidget(usage_button)
+		layout.addLayout(action_row)
+
+		note = QtWidgets.QLabel(
+			"Adding needs room in the last string pool for the new name; if that pool is full "
+			"you will be told so. Adding a name the archive ALREADY holds reuses it and needs "
+			"no such room. Writing a curve never allocates a name, and never edits the borrowed "
+			"array in place - curves are shared, so it always allocates a fresh one."
+		)
+		note.setWordWrap(True)
+		layout.addWidget(note)
+		self.update_curve_readout()
+		self.tabs.addTab(page, "Effects")
+
+	def _mark_effects_dirty(self):
+		self.effects_dirty = True
+
+	def closeEvent(self, event):
+		"""Warn about curve edits that were never written to the staged family.
+
+		The base class guards `file_widget.dirty`, but this tool never uses
+		file_widget - it has its own source/stage paths - so nothing was guarding
+		the Effects tab and an edited curve could be lost silently on quit.
+		"""
+		if getattr(self, "effects_dirty", False):
+			if not self.showconfirmation(
+					"Quit? The curve in the Effects tab has not been written to a "
+					"staged family, and those edits will be lost.", title="Quit"):
+				event.ignore()
+				return
+		super().closeEvent(event)
+
+	def update_curve_readout(self):
+		points = self.curve_editor.points
+		text = "  ".join("(%.2f, %g)" % (x, y) for x, y in points)
+		if points and points[-1][1] != 0.0:
+			text += "   -  ends ON: correct for a burst, wrong for a continuous emitter"
+		self.curve_readout.setText(text)
+
+	def scan_effect_activities(self):
+		try:
+			names = list_activities(self.source_path(), DEFAULT_GAME)
+			self.effect_activity.clear()
+			self.effect_activity.addItems(names)
+			self.status_bar.showMessage("%d activities" % len(names), 8000)
+		except Exception as error:
+			self.showerror(str(error))
+
+	def show_effect_streams(self):
+		try:
+			described = describe_activity(
+				self.source_path(), self.effect_activity.currentText().strip(), DEFAULT_GAME)
+			self.effect_list.clear()
+			for stream in described["streams"]:
+				QtWidgets.QTreeWidgetItem(
+					self.effect_list, [stream["ds_name"], stream["type"],
+									   str(stream.get("curve_type", ""))])
+			held = described.get("held")
+			note = (" - HELD activity (flags=%d): a VFXEnable here NEVER drops, use VFXToggle"
+					% described.get("animation_flags", 0)) if held else " - one-shot activity"
+			self.effect_held.setText(
+				("<b style='color:#C6402A'>HELD</b> (flags=%d) - an effect here must be "
+				 "<b>VFXToggle</b> or it will never switch off"
+				 % described.get("animation_flags", 0)) if held else
+				"one-shot activity (flags=%d)" % described.get("animation_flags", 0))
+			self.status_bar.showMessage(
+				"%s fires %d datastreams%s" % (described["activity"], described["count"], note),
+				15000)
+		except Exception as error:
+			self.showerror(str(error))
+
+	def load_effect_curve(self):
+		items = self.effect_list.selectedItems()
+		if not items:
+			return
+		name = items[0].text(0)
+		self.effect_name.setText(name)
+		self.effect_type.setEditText(items[0].text(1))
+		try:
+			points = read_data_stream_curve(
+				self.source_path(), self.effect_activity.currentText().strip(),
+				name, DEFAULT_GAME)
+			if points:
+				self.curve_editor.set_points(points)
+		except Exception as error:
+			logging.warning("Could not read curve for %s: %s" % (name, error))
+
+	def apply_effect_growth(self):
+		try:
+			report = grow_data_stream(
+				self.source_path(), self.output_path(),
+				self.effect_activity.currentText().strip(),
+				self.effect_name.text().strip(),
+				self.effect_type.currentText().strip(),
+				curve_points=list(self.curve_editor.points),
+				curve_type=curve_type_for(self.effect_type.currentText().strip()),
+				game=DEFAULT_GAME)
+
+			message = ("Added %s to %s: %d -> %d datastreams, +%d fragments"
+					   % (report.ds_name, report.activity, report.old_count,
+						  report.new_count, report.fragments_added))
+			self.effects_dirty = False
+			self.status_bar.showMessage(message, 15000)
+			logging.info(message)
+		except Exception as error:
+			self.showerror(str(error))
+
+	def show_effect_usage(self):
+		try:
+			rows = activities_with_stream(self.source_path(),
+										  self.effect_name.text().strip(), DEFAULT_GAME)
+			self.effect_list.clear()
+			self.effect_list.setHeaderLabels(["Activity", "Type", "curve_type / held"])
+			for row in rows:
+				item = QtWidgets.QTreeWidgetItem(
+					self.effect_list,
+					[row["activity"], row["type"],
+					 "%d  %s" % (row["curve_type"], "HELD" if row["held"] else "one-shot")])
+				if row["held"] and row["type"] != "VFXToggle":
+					item.setForeground(2, QtGui.QBrush(QtGui.QColor("#C6402A")))
+			bad = [r for r in rows if r["held"] and r["type"] != "VFXToggle"]
+			message = "%d activities fire %s" % (len(rows), self.effect_name.text().strip())
+			if bad:
+				message += " - %d are HELD but not VFXToggle and will never switch off" % len(bad)
+			self.status_bar.showMessage(message, 20000)
+		except Exception as error:
+			self.showerror(str(error))
+
+	def apply_effect_curve_everywhere(self):
+		try:
+			ds_type = self.effect_type.currentText().strip()
+			applied = set_curve_everywhere(
+				self.source_path(), self.output_path(),
+				self.effect_name.text().strip(), list(self.curve_editor.points),
+				DEFAULT_GAME, ds_type=ds_type, curve_type=curve_type_for(ds_type))
+			message = "Applied to %d activities as %s: %s" % (
+				len(applied), ds_type, ", ".join(a["activity"].split("$")[-1] for a in applied))
+			self.effects_dirty = False
+			self.status_bar.showMessage(message, 20000)
+			logging.info(message)
+		except Exception as error:
+			self.showerror(str(error))
+
+	def apply_effect_curve(self):
+		try:
+			ds_type = self.effect_type.currentText().strip()
+			result = set_data_stream_curve(
+				self.source_path(), self.output_path(),
+				self.effect_activity.currentText().strip(),
+				self.effect_name.text().strip(),
+				list(self.curve_editor.points), DEFAULT_GAME,
+				ds_type=ds_type, curve_type=curve_type_for(ds_type))
+			message = ("Wrote a %d-point curve onto %s / %s as %s"
+					   % (len(result["points"]), result["activity"],
+						  result["ds_name"], result["type"]))
+			self.effects_dirty = False
+			self.status_bar.showMessage(message, 15000)
+			logging.info(message)
+		except Exception as error:
+			self.showerror(str(error))
 
 	def _build_stage_tab(self):
 		page = QtWidgets.QWidget()
@@ -2028,6 +2687,69 @@ class MainWindow(window.MainWindow):
 			if item.flags() & QtCore.Qt.ItemIsUserCheckable:
 				item.setCheckState(0, state)
 
+	def browse_audio_soundmod(self):
+		path, _ = QtWidgets.QFileDialog.getOpenFileName(
+			self, "Replacement sound mod's <Donor>_media.ovl", "", "OVL (*.ovl)")
+		if path:
+			self.audio_soundmod.setText(path)
+
+	def browse_audio_out(self):
+		path = QtWidgets.QFileDialog.getExistingDirectory(self, "Output folder for the banks")
+		if path:
+			self.audio_out.setText(path)
+
+	def _audio_kit_dir(self):
+		"""Where JWE3 Audio Kit lives, relative to this cobra checkout."""
+		here = Path(__file__).resolve().parent
+		for base in (here.parent.parent, here.parent, here):
+			candidate = base / "JWE3 Audio Kit"
+			if (candidate / "build_species_audio.py").is_file():
+				return candidate
+		return None
+
+	def build_species_audio(self):
+		"""Run the audio kit's builder for the donor/prefix already entered above.
+
+		Driven as a subprocess rather than imported: the builder is a verified
+		pipeline with an argparse entry point, and shelling out keeps it that way.
+		"""
+		try:
+			kit = self._audio_kit_dir()
+			if kit is None:
+				raise ValueError(
+					"Could not find 'JWE3 Audio Kit' beside this cobra-tools checkout")
+			donor = self.audio_donor.text().strip()
+			prefix = self.audio_prefix.text().strip()
+			game = self.audio_game.text().strip()
+			out = self.audio_out.text().strip()
+			missing = [n for n, v in (("donor species", donor), ("new prefix", prefix),
+									  ("game folder", game), ("output folder", out)) if not v]
+			if missing:
+				raise ValueError("Fill in: " + ", ".join(missing))
+			cmd = [sys.executable, str(kit / "build_species_audio.py"),
+				   "--donor", donor, "--prefix", prefix, "--game", game, "--out", out]
+			sound_mod = self.audio_soundmod.text().strip()
+			if sound_mod:
+				cmd += ["--sound-mod", sound_mod]
+			logging.info("Building audio banks: %s" % " ".join(cmd))
+			result = subprocess.run(cmd, cwd=str(kit), capture_output=True, text=True)
+			for line in (result.stdout or "").splitlines():
+				logging.info("  %s" % line)
+			if result.returncode != 0:
+				for line in (result.stderr or "").splitlines()[-12:]:
+					logging.error("  %s" % line)
+				raise ValueError("Builder failed (exit %d) - see the log"
+								 % result.returncode)
+			produced = sorted(p.name for p in Path(out).glob("*")
+							  if p.suffix in (".bnk", ".add", ".json"))
+			message = ("Built %s. Copy the .bnk files into <Mod>/Audio/, then run "
+					   "merge_registry.bat - an unregistered event is NEVER posted."
+					   % ", ".join(produced))
+			self.status_bar.showMessage(message, 25000)
+			logging.info(message)
+		except Exception as error:
+			self.showerror(str(error))
+
 	def scan_audio_events(self):
 		try:
 			donor = self.audio_donor.text().strip()
@@ -2102,9 +2824,31 @@ class MainWindow(window.MainWindow):
 			)
 			message = ("Renamed %d audio events in one pass (%d changed bytes); "
 					   "staged family verified" % (report.renamed, report.changed_bytes))
-			if report.skipped:
-				message += " - %d skipped" % len(report.skipped)
-				for name, why in report.skipped:
+
+			# Names too long for their existing slot cannot be patched in place.
+			# Relocate those instead: allocate the longer string and repoint every
+			# fragment. Done as a second pass so short names stay cheap.
+			too_long = [(name, dict(pairs).get(name)) for name, why in report.skipped
+						if "slot has" in why or "needs" in why]
+			if too_long:
+				staged = self.output_path()
+				with tempfile.TemporaryDirectory(prefix="audio_reloc_") as tmp:
+					carry = Path(tmp) / staged.name
+					shutil.copy2(staged, carry)
+					for extra in staged.parent.glob(staged.stem + ".ovs.*"):
+						shutil.copy2(extra, Path(tmp) / extra.name)
+					moved = relocate_strings(carry, staged, too_long)
+				message += ("; %d too long for their slot were RELOCATED "
+							"(%d fragments repointed)"
+							% (moved.relocated, moved.fragments_repointed))
+				for name, why in moved.skipped:
+					logging.warning("Audio relocate skipped %s: %s" % (name, why))
+
+			remaining = [(n, w) for n, w in report.skipped
+						 if not ("slot has" in w or "needs" in w)]
+			if remaining:
+				message += " - %d skipped" % len(remaining)
+				for name, why in remaining:
 					logging.warning("Audio rename skipped %s: %s" % (name, why))
 			self.status_bar.showMessage(message, 15000)
 			logging.info(message)
