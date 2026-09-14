@@ -59,6 +59,7 @@ from .clone import (
 from .edit import DEFAULT_GAME, load_motiongraph
 from .report import build_deref
 from .surgical_growth import _load_quiet, append_tail_pool_bytes, repoint_pool_end_fragments
+from .staging import CandidatePublication, validate_staged_pair
 
 ENTRY_SIZE = 16
 COUNT_FIELD_OFFSET = 0
@@ -106,11 +107,7 @@ def set_chooser_weights(source: Path, output: Path, chooser_pool: int,
 						game: str = DEFAULT_GAME):
 	"""Rewrite one chooser's entry weights. Sizes never change, so this is a
 	fixed-topology byte edit - the safest operation available."""
-	source, output = Path(source).resolve(), Path(output).resolve()
-	if source == output:
-		raise ValueError("Refusing to overwrite the source OVL")
-	if source.name.lower() != output.name.lower() or not output.is_file():
-		raise ValueError("Output must be a staged same-basename OVL family")
+	source, output = validate_staged_pair(source, output)
 
 	rows = [r for r in list_choosers(source, name, game)
 			if r["pool"] == chooser_pool and r["offset"] == chooser_offset]
@@ -148,13 +145,15 @@ def set_chooser_weights(source: Path, output: Path, chooser_pool: int,
 	head = int(static.io_start)
 	struct.pack_into("<I", result, head + COMPRESSED_SIZE_OFFSET, new_compressed)
 	struct.pack_into("<Q", result, head + UNCOMPRESSED_SIZE_OFFSET, len(uncompressed))
-	output.write_bytes(result)
+	publication = CandidatePublication(source, output)
+	publication.path.write_bytes(result)
 
-	check = [r for r in list_choosers(output, name, game)
+	check = [r for r in list_choosers(publication.path, name, game)
 			 if r["pool"] == chooser_pool and r["offset"] == chooser_offset][0]
 	got = [c["weight"] for c in check["clips"]]
 	if got != weights:
 		raise ValueError(f"reloaded weights are {got}, expected {weights}")
+	publication.commit()
 	return check
 
 
@@ -184,6 +183,7 @@ def grow_random_animation_chooser(
 	offset_value: float | None = None,
 	name: str | None = None,
 	game: str = DEFAULT_GAME,
+	weights=None,
 ) -> ChooserGrowthReport:
 	"""Append `clip_name` to the chooser at `chooser_pool:chooser_offset`.
 
@@ -191,14 +191,13 @@ def grow_random_animation_chooser(
 	the capacity audit. `weight` and `offset_value` default to whatever the
 	chooser's LAST existing entry uses, so the new clip is drawn on the same terms
 	as its siblings unless the caller says otherwise.
+
+	`weights` re-weights the WHOLE grown chooser (count + 1 values) in this same
+	pass. Use it instead of a follow-up `set_chooser_weights`: that function
+	refuses source == output, so "grow then re-weight" as two calls re-read the
+	original archive and discarded the added clip.
 	"""
-	source, output = Path(source).resolve(), Path(output).resolve()
-	if source == output:
-		raise ValueError("Refusing to overwrite the source OVL")
-	if source.name.lower() != output.name.lower():
-		raise ValueError("Source and staged output OVL basenames must match")
-	if not output.is_file():
-		raise ValueError("Copy the complete archive family to the stage directory first")
+	source, output = validate_staged_pair(source, output)
 	if not clip_name or any(ord(c) > 126 or ord(c) < 32 for c in clip_name):
 		raise ValueError(f"Clip name must be printable ASCII: {clip_name!r}")
 
@@ -270,7 +269,24 @@ def grow_random_animation_chooser(
 	new_entry = bytearray(ENTRY_SIZE)
 	struct.pack_into("<f", new_entry, 8, float(offset_value))
 	struct.pack_into("<I", new_entry, 12, int(weight))
-	new_array = bytes(old_bytes) + bytes(new_entry)
+	new_array = bytearray(bytes(old_bytes) + bytes(new_entry))
+
+	# Re-weighting has to happen HERE, in the same staged pass, not as a second
+	# call. `set_chooser_weights` refuses source == output, so growing and then
+	# re-weighting used to fall back to re-reading the ORIGINAL ovl and silently
+	# threw the new clip away.
+	if weights is not None:
+		weights = [int(w) for w in weights]
+		if len(weights) != count + 1:
+			raise ValueError(
+				f"chooser will have {count + 1} clips after the add, got {len(weights)} weights")
+		if any(w < 0 or w > 0xFFFFFFFF for w in weights):
+			raise ValueError("weights must fit in a uint32")
+		if not any(weights):
+			raise ValueError("at least one weight must be non-zero or nothing can be drawn")
+		for index, value in enumerate(weights):
+			struct.pack_into("<I", new_array, index * ENTRY_SIZE + 12, value)
+	new_array = bytes(new_array)
 
 	old_fragments = int(static.num_fragments)
 	old_uncompressed = int(static.uncompressed_size)
@@ -376,9 +392,10 @@ def grow_random_animation_chooser(
 	struct.pack_into("<Q", result, head + UNCOMPRESSED_SIZE_OFFSET, expected_uncompressed)
 	struct.pack_into("<I", result, head + POOLS_END_OFFSET, old_pools_end + pool_growth)
 	struct.pack_into("<I", result, meta_offset, old_reservation + pool_growth)
-	output.write_bytes(result)
+	publication = CandidatePublication(source, output)
+	publication.path.write_bytes(result)
 
-	check_ovl, check_loader = load_motiongraph(output, name or None, game)
+	check_ovl, check_loader = load_motiongraph(publication.path, name or None, game)
 	check_deref = build_deref(check_loader)
 	grown = None
 	for (pool, offset), obj in check_loader.context.recursion.items():
@@ -396,6 +413,8 @@ def grow_random_animation_chooser(
 			f"  num_animations {int(grown.num_animations)} (wanted {count + 1})\n"
 			f"  got    {names!r}\n"
 			f"  wanted {wanted!r}")
+
+	publication.commit()
 
 	return ChooserGrowthReport(
 		output=output, chooser=(chooser_pool, chooser_offset),

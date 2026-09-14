@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import struct
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from .clone import (NUM_FRAGMENTS_OFFSET, POOLS_END_OFFSET,
                     UNCOMPRESSED_SIZE_OFFSET)
 from .surgical_growth import (_load_quiet, append_tail_pool_bytes,
                               repoint_pool_end_fragments)
+from .staging import CandidatePublication, copy_motiongraph_family, validate_staged_pair
 
 
 DEFAULT_GAME = "Jurassic World Evolution 3"
@@ -68,14 +70,7 @@ def _decompressed_static(source: Path, ovl, static) -> bytes:
 
 
 def _require_staged_output(source: Path, output: Path):
-    source, output = source.resolve(), output.resolve()
-    if source == output:
-        raise ValueError("Refusing to overwrite the source OVL; use a complete staged family")
-    if source.name.lower() != output.name.lower():
-        raise ValueError(
-            "Source and output OVL basenames must match so the staged OVS/AUX family can reload"
-        )
-    return source, output
+    return validate_staged_pair(source, output)
 
 
 def _publish(source: Path, output: Path, ovl, static, original: bytes,
@@ -91,9 +86,9 @@ def _publish(source: Path, output: Path, ovl, static, original: bytes,
     struct.pack_into(
         "<I", result, int(static.io_start) + COMPRESSED_SIZE_OFFSET, new_size
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_bytes(result)
-    return old_size, new_size
+    publication = CandidatePublication(source, output)
+    publication.path.write_bytes(result)
+    return old_size, new_size, publication
 
 
 def _find_unique_pool_string(static, text: str) -> tuple[int, int, bytes]:
@@ -147,14 +142,15 @@ def patch_string_slot(source: Path, output: Path, source_text: str, target_text:
                if left != right}
     if not changed.issubset(range(absolute, absolute + len(encoded_source))):
         raise ValueError("Bytes outside the string allocation changed")
-    old_size, new_size = _publish(source, output, ovl, static, original, bytes(modified))
+    old_size, new_size, publication = _publish(source, output, ovl, static, original, bytes(modified))
 
-    check, check_static = _load(output, game)
+    check, check_static = _load(publication.path, game)
     if _topology(check) != _topology(ovl):
         raise ValueError(f"Topology changed: {_topology(ovl)} -> {_topology(check)}")
     checked_pool = check_static.content.pools[pool_index].data.getvalue()
     if checked_pool[source_offset:source_offset + len(encoded_source)] != replacement:
         raise ValueError("String replacement did not survive staged-family reload")
+    publication.commit()
     return StaticPatchReport(
         output, len(changed), old_size, new_size, _topology(check),
         pool_index, source_offset,
@@ -207,9 +203,9 @@ def repoint_existing_string(source: Path, output: Path, source_text: str,
                if left != right}
     if not changed.issubset(allowed):
         raise ValueError("Bytes outside the selected fragment offsets changed")
-    old_size, new_size = _publish(source, output, ovl, static, original, bytes(modified))
+    old_size, new_size, publication = _publish(source, output, ovl, static, original, bytes(modified))
 
-    check, check_static = _load(output, game)
+    check, check_static = _load(publication.path, game)
     if _topology(check) != _topology(ovl):
         raise ValueError(f"Topology changed: {_topology(ovl)} -> {_topology(check)}")
     check_fragments = check_static.content.fragments
@@ -222,6 +218,7 @@ def repoint_existing_string(source: Path, output: Path, source_text: str,
             f"Fragment reload mismatch: source {count}->{source_after}, "
             f"target {target_before}->{target_after}"
         )
+    publication.commit()
     return StaticPatchReport(
         output, len(changed), old_size, new_size, _topology(check),
         source_pool, source_offset, target_pool, target_offset, expected_count,
@@ -313,17 +310,19 @@ def patch_string_slots(source: Path, output: Path, pairs, *,
     if not changed.issubset(allowed):
         raise ValueError("Bytes outside the string allocations changed")
 
-    old_size, new_size = _publish(source, output, ovl, static, original, bytes(modified))
+    old_size, new_size, publication = _publish(source, output, ovl, static, original, bytes(modified))
 
     # A successful write is not verification: reload the staged family and read
     # every replacement back out of the pools.
-    check, check_static = _load(output, game)
+    check, check_static = _load(publication.path, game)
     if _topology(check) != _topology(ovl):
         raise ValueError(f"Topology changed: {_topology(ovl)} -> {_topology(check)}")
-    check_bytes = _decompressed_static(output, check, check_static)
+    check_bytes = _decompressed_static(publication.path, check, check_static)
     for absolute, encoded_source, replacement in plan:
         if check_bytes[absolute:absolute + len(replacement)] != replacement:
             raise ValueError("A replacement did not survive the staged-family reload")
+
+    publication.commit()
 
     return BatchPatchReport(output, len(plan), len(changed), old_size, new_size,
                             _topology(check), skipped)
@@ -336,6 +335,14 @@ class RelocateReport:
     fragments_repointed: int
     pool_growth: int
     skipped: list
+
+
+@dataclass(frozen=True)
+class RenameReport:
+    output: Path
+    in_place: int
+    relocated: int
+    fragments_repointed: int
 
 
 def relocate_strings(source: Path, output: Path, pairs, *,
@@ -448,10 +455,11 @@ def relocate_strings(source: Path, output: Path, pairs, *,
     struct.pack_into("<Q", result, head + UNCOMPRESSED_SIZE_OFFSET, expected)
     struct.pack_into("<I", result, head + POOLS_END_OFFSET, old_pools_end + pool_growth)
     struct.pack_into("<I", result, meta_offset, old_reservation + pool_growth)
-    output.write_bytes(result)
+    publication = CandidatePublication(source, output)
+    publication.path.write_bytes(result)
 
     # a written file is not a verified one: every new string must be readable back
-    check_ovl, check_static = _load_quiet(output, game)
+    check_ovl, check_static = _load_quiet(publication.path, game)
     pools = check_static.content.pools
     for _source_text, target_text in pairs:
         if any(name == _source_text for name, _ in skipped):
@@ -459,6 +467,110 @@ def relocate_strings(source: Path, output: Path, pairs, *,
         needle = target_text.encode("ascii") + b"\0"
         if not any(int(p.type) == 2 and needle in p.data.getvalue() for p in pools):
             raise ValueError(f"Reloaded archive has no string {target_text!r}")
+    publication.commit()
     logging.info("Relocated %d strings, repointed %d fragments, +%d bytes",
                  len(allocations), repointed, pool_growth)
     return RelocateReport(output, len(allocations), repointed, pool_growth, skipped)
+
+
+def apply_string_renames(source: Path, output: Path, pairs, *,
+                         game: str = DEFAULT_GAME) -> RenameReport:
+    """Apply an all-or-nothing mixture of in-place and relocated string renames."""
+    source, output = validate_staged_pair(source, output)
+    publication = CandidatePublication(source, output)
+    pairs = list(pairs)
+    if not pairs:
+        raise ValueError("Choose at least one string to rename")
+    in_place, relocated = [], []
+    seen = set()
+    for old, new in pairs:
+        if old in seen:
+            raise ValueError(f"Duplicate source string in rename request: {old!r}")
+        seen.add(old)
+        try:
+            old_bytes, new_bytes = old.encode("ascii"), new.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("Motiongraph strings must be ASCII") from exc
+        if old == new:
+            raise ValueError(f"Source and target are identical: {old!r}")
+        (in_place if len(new_bytes) <= len(old_bytes) else relocated).append((old, new))
+
+    def string_references(path):
+        _ovl, archive = _load(path, game)
+        pools, fragments = archive.content.pools, archive.content.fragments
+        result = {}
+        for row in fragments:
+            pool_index, offset = int(row["struct_pool"]), int(row["struct_offset"])
+            if pool_index >= len(pools) or int(pools[pool_index].type) != 2:
+                continue
+            blob = pools[pool_index].data.getvalue()
+            if offset >= len(blob) or (offset and blob[offset - 1] != 0):
+                continue
+            end = blob.find(b"\0", offset)
+            if end < 0:
+                continue
+            try:
+                value = blob[offset:end].decode("ascii")
+            except UnicodeDecodeError:
+                continue
+            result[(int(row["link_pool"]), int(row["link_offset"]))] = value
+        return result
+
+    references_before = string_references(source)
+    replacements = dict(pairs)
+    with tempfile.TemporaryDirectory(prefix="motiongraph-rename-", dir=output.parent) as raw:
+        root = Path(raw)
+        source_files = copy_motiongraph_family(source, root / "source")
+        current = root / "source" / source.name
+        in_place_report = None
+        if in_place:
+            copy_motiongraph_family(current, root / "short")
+            destination = root / "short" / source.name
+            in_place_report = patch_string_slots(current, destination, in_place, game=game)
+            if in_place_report.skipped:
+                raise ValueError("Unsupported audio renames: " + "; ".join(
+                    f"{name}: {why}" for name, why in in_place_report.skipped))
+            current = destination
+
+        relocate_report = None
+        if relocated:
+            copy_motiongraph_family(current, root / "relocate-source")
+            relocation_source = root / "relocate-source" / source.name
+            copy_motiongraph_family(relocation_source, root / "relocate-output")
+            destination = root / "relocate-output" / source.name
+            relocate_report = relocate_strings(
+                relocation_source, destination, relocated, game=game)
+            if relocate_report.skipped:
+                raise ValueError("Unsupported audio relocations: " + "; ".join(
+                    f"{name}: {why}" for name, why in relocate_report.skipped))
+            current = destination
+
+        # Final semantic gate: each requested target has at least one fragment.
+        _check, static = _load(current, game)
+        fragments = static.content.fragments
+        for _old, target in pairs:
+            encoded = target.encode("ascii") + b"\0"
+            refs = 0
+            for pool_index, pool in enumerate(static.content.pools):
+                blob = pool.data.getvalue()
+                at = blob.find(encoded)
+                while at >= 0:
+                    if at == 0 or blob[at - 1] == 0:
+                        refs += int(((fragments["struct_pool"] == pool_index)
+                                    & (fragments["struct_offset"] == at)).sum())
+                    at = blob.find(encoded, at + 1)
+            if refs == 0:
+                raise ValueError(f"Renamed target has no fragment references after reload: {target!r}")
+        references_after = string_references(current)
+        for site, old_value in references_before.items():
+            wanted = replacements.get(old_value, old_value)
+            if references_after.get(site) != wanted:
+                raise ValueError(
+                    f"String reference {site[0]}:{site[1]} changed unexpectedly: "
+                    f"{old_value!r} -> {references_after.get(site)!r}; wanted {wanted!r}"
+                )
+        publication.path.write_bytes(current.read_bytes())
+        publication.commit()
+        return RenameReport(
+            output, len(in_place), len(relocated),
+            relocate_report.fragments_repointed if relocate_report else 0)

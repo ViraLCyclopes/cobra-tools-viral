@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import math
 import logging
-import shutil
 import subprocess
 import sys
 import tempfile
+import hashlib
 from pathlib import Path
 
 from gui import GuiOptions, startup, widgets
@@ -35,11 +35,12 @@ from source.formats.motiongraph.capacity import (
 	render_capacity_markdown,
 )
 from source.formats.motiongraph.decision_growth import (
-	add_state,
+	add_state_and_route,
 	grow_decision_chooser,
 	inbound_count,
 	list_decision_choosers,
 	list_states,
+	set_activity_clip,
 )
 from source.formats.motiongraph.chooser_growth import (
 	grow_random_animation_chooser,
@@ -56,14 +57,16 @@ from source.formats.motiongraph.report import (
 	build_decision_report,
 	build_state_report,
 )
-from source.formats.motiongraph.static_patch import (patch_string_slot, patch_string_slots,
-															 relocate_strings,
+from source.formats.motiongraph.static_patch import (apply_string_renames, patch_string_slot, patch_string_slots,
+													 relocate_strings,
                                                      repoint_existing_string)
 from source.formats.motiongraph import audio_events
 from source.formats.motiongraph.datastream_growth import (
 	activities_with_stream, curve_type_for, describe_activity, grow_data_stream,
-	is_held, list_activities, read_data_stream_curve, set_curve_everywhere,
+	is_held, list_activity_records, read_data_stream_curve, set_curve_everywhere,
 	set_data_stream_curve)
+from source.formats.motiongraph.staging import (
+	copy_motiongraph_family, motiongraph_family)
 
 
 def describe_motiongraph_field(path: str, kind: str = "") -> str:
@@ -98,42 +101,6 @@ def describe_motiongraph_field(path: str, kind: str = "") -> str:
 	return "Fixed-width activity setting. Keep donor values unless its gameplay meaning is understood."
 
 
-def motiongraph_family(source: Path) -> list[Path]:
-	"""Return the main OVL and its same-basename OVS/AUX companions."""
-	source = source.resolve()
-	if source.suffix.lower() != ".ovl" or not source.is_file():
-		raise ValueError("Choose an existing .ovl file")
-	prefix = source.stem.lower() + "."
-	result = []
-	for candidate in source.parent.iterdir():
-		name = candidate.name.lower()
-		# JWE3 AUX companions are hash-named rather than OVL-basename-prefixed.
-		# Include every AUX in the source archive directory along with the named
-		# OVL/OVS streams so "full family" really is load-complete.
-		if candidate.is_file() and (
-			(name.startswith(prefix) and (name.endswith(".ovl") or ".ovs" in name))
-			or name.endswith(".aux")
-		):
-			result.append(candidate)
-	if source not in result:
-		result.append(source)
-	return sorted(set(result), key=lambda path: path.name.lower())
-
-
-def copy_motiongraph_family(source: Path, stage_dir: Path) -> list[Path]:
-	"""Copy a complete archive family without modifying the source directory."""
-	source, stage_dir = source.resolve(), stage_dir.resolve()
-	if source.parent == stage_dir:
-		raise ValueError("The stage directory must differ from the source directory")
-	stage_dir.mkdir(parents=True, exist_ok=True)
-	outputs = []
-	for member in motiongraph_family(source):
-		output = stage_dir / member.name
-		shutil.copy2(member, output)
-		outputs.append(output)
-	return outputs
-
-
 def _load_reports(source: Path, name: str | None):
 	ovl, loader = load_motiongraph(source, name or None, DEFAULT_GAME)
 	state_text, states, state_stats = build_state_report(loader)
@@ -143,6 +110,70 @@ def _load_reports(source: Path, name: str | None):
 		ovl, loader, state_text, states, state_stats,
 		decision_text, decision_stats, decision_graph,
 	)
+
+
+def _load_reports_identity(source: Path, name: str | None, generation: int):
+	source = Path(source).resolve()
+	before = hashlib.sha256(source.read_bytes()).hexdigest()
+	reports = _load_reports(source, name)
+	after = hashlib.sha256(source.read_bytes()).hexdigest()
+	if before != after:
+		raise ValueError("Source OVL changed while it was loading; try again")
+	return generation, source, reports[1].name, before, reports
+
+
+def _scan_fields_identity(generation, identity, *args):
+	return generation, identity, locate_fields(*args)
+
+
+def prepare_next_stage(source: Path, name: str | None):
+	"""Snapshot a staged result and validate it before advancing editor state."""
+	source = source.resolve()
+	if not source.is_file():
+		raise ValueError("The staged result is missing")
+	# Unique directories preserve every prior result and never overwrite a family.
+	root = Path(tempfile.mkdtemp(prefix="motiongraph-step-", dir=source.parent.parent))
+	copy_motiongraph_family(source, root / "source")
+	snapshot = root / "source" / source.name
+	reports = _load_reports(snapshot, name)
+	outputs = copy_motiongraph_family(snapshot, root / "output")
+	return snapshot, root / "output", outputs, reports
+
+
+def audio_build_command(kit, cobra, donor, prefix, game, out, sound_mod="", sounds="", marker="", baseline=False):
+	missing = [n for n, v in (("donor species", donor), ("new prefix", prefix),
+		("game folder", game), ("output folder", out)) if not v]
+	if missing:
+		raise ValueError("Fill in: " + ", ".join(missing))
+	if not (Path(cobra) / "ovl_tool_cmd.py").is_file():
+		raise ValueError("This Cobra checkout has no ovl_tool_cmd.py")
+	if not baseline and sounds and marker:
+		raise ValueError("Choose custom WEMs or a marker build; clear the other field first")
+	cmd = [sys.executable, str(Path(kit) / "build_species_audio.py"), "--cobra", str(cobra),
+		"--donor", donor, "--prefix", prefix, "--game", str(Path(game).resolve()), "--out", str(Path(out).resolve())]
+	for flag, value, directory in (("--sound-mod", sound_mod, False),
+		("--sounds", "" if baseline else sounds, True),
+		("--marker-from", "" if baseline else marker, False)):
+		if value:
+			path = Path(value)
+			if not (path.is_dir() if directory else path.is_file()):
+				raise ValueError(f"{flag}: path does not exist: {value}")
+			cmd += [flag, str(path.resolve())]
+	return cmd
+
+
+def run_audio_build(cmd, kit):
+	result = subprocess.run(cmd, cwd=str(kit), capture_output=True, text=True, errors="replace")
+	log = (result.stdout or "") + "\n" + (result.stderr or "")
+	if result.returncode:
+		raise ValueError(f"Audio builder failed (exit {result.returncode}):\n{log[-6000:]}")
+	out = Path(cmd[cmd.index("--out") + 1])
+	prefix = cmd[cmd.index("--prefix") + 1].lower()
+	names = [prefix + suffix for suffix in ("_events.bnk", "_media.bnk", ".wmetasb.add")]
+	names += ["report.json", "sounds_available.txt"]
+	if any(not (out / name).is_file() for name in names):
+		raise ValueError("Builder exited successfully but expected outputs are missing")
+	return out, names, log
 
 
 def hierarchical_neighborhood_positions(center, visible, edge_pairs,
@@ -568,6 +599,13 @@ class MainWindow(window.MainWindow):
 		self.activity_address_filter = None
 		self.activity_tree_state = None
 		self.clone_redirect_source = None
+		self.loaded_identity = None
+		self.editor_generation = 0
+		self.scan_generation = None
+		self.effect_loaded_target = None
+		self.effect_draft = None
+		self.stage_has_result = False
+		self.audio_scan_identity = None
 
 		root = QtWidgets.QVBoxLayout(self.body)
 		banner = QtWidgets.QLabel(
@@ -998,7 +1036,70 @@ class MainWindow(window.MainWindow):
 		form.addRow("Allocated source string", self.slot_from)
 		form.addRow("Replacement string", self.slot_to)
 		form.addRow(slot_button)
+
+		line2 = QtWidgets.QFrame()
+		line2.setFrameShape(QtWidgets.QFrame.HLine)
+		form.addRow(line2)
+		single = QtWidgets.QLabel(
+			"<b>Set the clip on ONE activity.</b> The two operations above move EVERY reference to a "
+			"string, or overwrite a string in place. This moves a single activity's clip pointer and "
+			"ALLOCATES the name if the archive does not have it, so a clone can be given its own clip. "
+			"Select the activity in <b>States</b> first (the same selection Clone Activity uses)."
+		)
+		single.setWordWrap(True)
+		form.addRow(single)
+		self.single_clip_label = QtWidgets.QLabel("No activity selected")
+		self.single_clip_label.setWordWrap(True)
+		form.addRow("Selected activity", self.single_clip_label)
+		self.single_clip_name = QtWidgets.QLineEdit()
+		self.single_clip_name.setPlaceholderText("Full clip name, e.g. Species$StandPreen03")
+		form.addRow("New clip name", self.single_clip_name)
+		single_button = QtWidgets.QPushButton("Set clip on selected activity in staged family")
+		single_button.clicked.connect(self.apply_single_clip)
+		form.addRow(single_button)
+		warn = QtWidgets.QLabel(
+			"Writes the REFERENCE, not the animation. The clip must exist in the .manis bundles or "
+			"the activity resolves to nothing."
+		)
+		warn.setWordWrap(True)
+		warn.setStyleSheet("color: #ffe075; padding: 4px 0;")
+		form.addRow(warn)
 		self.tabs.addTab(page, "Clip Retarget")
+
+	def apply_single_clip(self):
+		"""Point one activity at a clip name, allocating it if it is new.
+
+		Chaining note: like every tab here this reads `source` and writes the
+		stage. To clone an activity and then give the clone its own clip, run the
+		clone, then point `source` at the staged file and re-stage before this.
+		"""
+		try:
+			selection = getattr(self, "activity_address_filter", None)
+			if not selection:
+				raise ValueError(
+					"Select an activity in the States tab first - the same selection "
+					"Clone Activity uses")
+			pool, offset = selection
+			clip = self.single_clip_name.text().strip()
+			if not clip:
+				raise ValueError("Enter the full clip name, e.g. Species$StandPreen03")
+			report = set_activity_clip(self.source_path(), self.output_path(), pool, offset,
+									   clip, name=self.name_edit.text().strip() or None,
+									   game=DEFAULT_GAME)
+			self.status_bar.showMessage(
+				f"{report.old_clip} -> {report.new_clip} on activity {pool}:{offset}", 12000)
+			logging.info(f"Single-activity clip retarget: {report}")
+			# Allocating a name grows a type-2 pool but adds no decoded object;
+			# reusing an existing one changes nothing at all.
+			self.census_guard("single clip retarget", expect_added=0, expect_removed=0)
+			if report.allocated:
+				self.showerror(
+					f"'{report.new_clip}' was ALLOCATED in the type-2 tail at "
+					f"{report.string_at[0]}:{report.string_at[1]}. It must exist as a real clip in "
+					f"the .manis bundles or the activity will resolve to nothing. Test IN GAME."
+				)
+		except Exception as exc:
+			self.showerror(str(exc))
 
 	def _build_chooser_tab(self):
 		page = QtWidgets.QWidget()
@@ -1054,6 +1155,13 @@ class MainWindow(window.MainWindow):
 		self.chooser_add_weight.setRange(1, 10000)
 		self.chooser_add_weight.setValue(1)
 		form.addRow("Its weight", self.chooser_add_weight)
+		self.chooser_add_weights = QtWidgets.QLineEdit()
+		self.chooser_add_weights.setPlaceholderText(
+			"Optional: all weights after the add, comma separated (one per clip, including the new one)")
+		self.chooser_add_weights.setToolTip(
+			"Re-weight in the SAME pass as the add. Applying weights as a second, separate "
+			"operation re-reads the original source and throws the added clip away.")
+		form.addRow("Re-weight all", self.chooser_add_weights)
 		add_button = QtWidgets.QPushButton("Add clip to chooser in staged family")
 		add_button.clicked.connect(self.apply_chooser_add)
 		form.addRow(add_button)
@@ -1118,7 +1226,12 @@ class MainWindow(window.MainWindow):
 		self.decision_twin_state = QtWidgets.QSpinBox()
 		self.decision_twin_state.setRange(0, 9999)
 		form.addRow("New state twinned on", self.decision_twin_state)
-		state_button = QtWidgets.QPushButton("Add new state to staged family")
+		self.decision_new_weight = QtWidgets.QSpinBox()
+		self.decision_new_weight.setRange(1, 100000)
+		self.decision_new_weight.setValue(1)
+		form.addRow("Its weight", self.decision_new_weight)
+		state_button = QtWidgets.QPushButton(
+			"Add new state AND route to it, in the selected chooser")
 		state_button.clicked.connect(self.apply_add_state)
 		form.addRow(state_button)
 		layout.addLayout(form)
@@ -1200,19 +1313,31 @@ class MainWindow(window.MainWindow):
 			self.showerror(str(exc))
 
 	def apply_add_state(self):
+		"""Add a state AND its inbound route in ONE pass.
+
+		Not two operations: every tab reads `source` and writes the stage, so
+		adding the state and then routing to it separately would have the second
+		call discard the first. A dormant state is useless anyway.
+		"""
 		try:
+			pool, offset = self._selected_decision()
 			twin = self.decision_twin_state.value()
-			report = add_state(self.source_path(), self.output_path(), twin,
-							   name=self.name_edit.text().strip() or None, game=DEFAULT_GAME)
+			report = add_state_and_route(
+				self.source_path(), self.output_path(), twin, pool, offset,
+				weight=self.decision_new_weight.value(),
+				name=self.name_edit.text().strip() or None, game=DEFAULT_GAME)
 			self.status_bar.showMessage(
 				f"States {report.old_count} -> {report.new_count}; "
-				f"new STATE[{report.new_state_index}]", 15000)
-			logging.info(f"New state added: {report}")
+				f"new STATE[{report.new_state_index}] routed from {pool}:{offset}", 15000)
+			logging.info(f"New state added and routed: {report}")
 			self.census_guard("new state", expect_added=None, expect_removed=None)
 			self.showerror(
-				f"STATE[{report.new_state_index}] exists but is DORMANT - nothing routes to it "
-				f"yet. Add a chooser result pointing at index {report.new_state_index}, then "
-				f"test IN GAME. Cobra reload is not proof of engine acceptance."
+				f"STATE[{report.new_state_index}] added (twin of [{twin}]) and routed from "
+				f"chooser {pool}:{offset} at weight {self.decision_new_weight.value()}.\n\n"
+				f"It currently plays the SAME clips as its twin - that is what makes the "
+				f"change visible. Give it its own AnimationActivity to make it a distinct "
+				f"behaviour.\n\nThis raises the state count, which is topology growth. Cobra "
+				f"reload is not proof of engine acceptance - test IN GAME."
 			)
 		except Exception as exc:
 			self.showerror(str(exc))
@@ -1333,7 +1458,24 @@ class MainWindow(window.MainWindow):
 		out_holder = QtWidgets.QWidget(); out_holder.setLayout(out_row)
 
 		build_form.addRow("Replacement sound mod", sm_holder)
+		self.audio_sounds = QtWidgets.QLineEdit()
+		self.audio_sounds.setPlaceholderText("optional: folder of <EventSuffix>.wem files")
+		self.audio_marker = QtWidgets.QLineEdit()
+		self.audio_marker.setPlaceholderText("optional: media OVL for a distinctive test sound")
+		for label, field, pick in (("Custom WEM folder", self.audio_sounds, self.browse_audio_sounds),
+			("Marker media OVL", self.audio_marker, self.browse_audio_marker)):
+			row = QtWidgets.QHBoxLayout()
+			row.addWidget(field, 1)
+			button = QtWidgets.QPushButton("Browse...")
+			button.clicked.connect(pick)
+			row.addWidget(button)
+			holder = QtWidgets.QWidget(); holder.setLayout(row)
+			build_form.addRow(label, holder)
 		build_form.addRow("Output folder", out_holder)
+		baseline = QtWidgets.QPushButton("Build baseline / discover WEM names")
+		baseline.setToolTip("Build donor audio and sounds_available.txt; ignore Custom WEM and Marker fields for this build. Uses the selected output folder.")
+		baseline.clicked.connect(lambda: self.build_species_audio(baseline=True))
+		build_form.addRow(baseline)
 		self.audio_build = QtWidgets.QPushButton("Build species audio banks")
 		self.audio_build.setToolTip(
 			"Re-IDs the donor's banks onto a new prefix so this species has its own "
@@ -1342,6 +1484,16 @@ class MainWindow(window.MainWindow):
 			"non-replacement mod instead.")
 		self.audio_build.clicked.connect(self.build_species_audio)
 		build_form.addRow(self.audio_build)
+		outputs_row = QtWidgets.QHBoxLayout()
+		for label, filename in (("Open WEM suffix list", "sounds_available.txt"),
+			("Open build report", "report.json"), ("Open output folder", "")):
+			button = QtWidgets.QPushButton(label)
+			button.clicked.connect(lambda _checked=False, name=filename: self.open_audio_output(name))
+			outputs_row.addWidget(button)
+		build_form.addRow(outputs_row)
+		hint = QtWidgets.QLabel("Custom recordings must already be compatible WEMs. Build a baseline, open the suffix list, name your WEMs accordingly, then select their folder and build. Use a fresh output folder for each build. Copy BOTH banks and the fragment; then merge.")
+		hint.setWordWrap(True)
+		build_form.addRow(hint)
 		layout.addWidget(build_box)
 
 		scan_button = QtWidgets.QPushButton("2. Scan graph for audio events")
@@ -1382,7 +1534,10 @@ class MainWindow(window.MainWindow):
 		)
 		note.setWordWrap(True)
 		layout.addWidget(note)
-		self.tabs.addTab(page, "Audio Events")
+		scroll = QtWidgets.QScrollArea()
+		scroll.setWidgetResizable(True)
+		scroll.setWidget(page)
+		self.tabs.addTab(scroll, "Audio Events")
 
 	def _build_effects_tab(self):
 		page = QtWidgets.QWidget()
@@ -1464,19 +1619,25 @@ class MainWindow(window.MainWindow):
 		layout.addLayout(preset_row)
 
 		action_row = QtWidgets.QHBoxLayout()
-		add_button = QtWidgets.QPushButton("Add datastream to staged family")
-		add_button.clicked.connect(self.apply_effect_growth)
-		set_button = QtWidgets.QPushButton("Write curve to staged family")
-		set_button.clicked.connect(self.apply_effect_curve)
-		all_button = QtWidgets.QPushButton("Write to ALL activities firing this name")
-		all_button.setToolTip("Applies this curve and type to every activity that already "
+		self.effect_add_button = QtWidgets.QPushButton("Add datastream to staged family")
+		self.effect_add_button.clicked.connect(self.apply_effect_growth)
+		self.effect_set_button = QtWidgets.QPushButton("Write curve to staged family")
+		self.effect_set_button.clicked.connect(self.apply_effect_curve)
+		self.effect_set_button.setEnabled(False)
+		self.effect_all_button = QtWidgets.QPushButton("Write to ALL activities firing this name")
+		self.effect_all_button.setToolTip("Applies this curve and type to every activity that already "
 							  "fires this datastream, chaining the rewrites for you.")
-		all_button.clicked.connect(self.apply_effect_curve_everywhere)
+		self.effect_all_button.clicked.connect(self.apply_effect_curve_everywhere)
+		self.effect_discard_button = QtWidgets.QPushButton("Discard curve edits")
+		self.effect_discard_button.setToolTip(
+			"Reload the selected curve and clear its undo/redo history.")
+		self.effect_discard_button.clicked.connect(self.discard_effect_curve_edits)
 		usage_button = QtWidgets.QPushButton("Where is it used?")
 		usage_button.clicked.connect(self.show_effect_usage)
-		action_row.addWidget(add_button)
-		action_row.addWidget(set_button)
-		action_row.addWidget(all_button)
+		action_row.addWidget(self.effect_add_button)
+		action_row.addWidget(self.effect_set_button)
+		action_row.addWidget(self.effect_all_button)
+		action_row.addWidget(self.effect_discard_button)
 		action_row.addWidget(usage_button)
 		layout.addLayout(action_row)
 
@@ -1518,22 +1679,35 @@ class MainWindow(window.MainWindow):
 
 	def scan_effect_activities(self):
 		try:
-			names = list_activities(self.source_path(), DEFAULT_GAME)
+			records = list_activity_records(self.source_path(), DEFAULT_GAME)
 			self.effect_activity.clear()
-			self.effect_activity.addItems(names)
-			self.status_bar.showMessage("%d activities" % len(names), 8000)
+			counts = {}
+			for record in records:
+				counts[record["activity"]] = counts.get(record["activity"], 0) + 1
+			for record in records:
+				label = record["activity"]
+				if counts[label] > 1:
+					label += "  [%d:%d]" % (record["activity_pool"], record["activity_offset"])
+				self.effect_activity.addItem(label, (record["activity_pool"], record["activity_offset"], record["activity"]))
+			self.status_bar.showMessage("%d activities" % len(records), 8000)
 		except Exception as error:
 			self.showerror(str(error))
 
 	def show_effect_streams(self):
 		try:
+			identity = self.current_effect_activity()
 			described = describe_activity(
-				self.source_path(), self.effect_activity.currentText().strip(), DEFAULT_GAME)
+				self.source_path(), identity[2], DEFAULT_GAME,
+				activity_address=identity[:2])
 			self.effect_list.clear()
+			self.effect_list.setHeaderLabels(["Datastream", "Type", "curve_type"])
 			for stream in described["streams"]:
-				QtWidgets.QTreeWidgetItem(
+				item = QtWidgets.QTreeWidgetItem(
 					self.effect_list, [stream["ds_name"], stream["type"],
 									   str(stream.get("curve_type", ""))])
+				item.setData(0, QtCore.Qt.UserRole, "stream")
+				item.setData(0, QtCore.Qt.UserRole + 1, identity)
+				item.setData(0, QtCore.Qt.UserRole + 2, stream["ds_name"])
 			held = described.get("held")
 			note = (" - HELD activity (flags=%d): a VFXEnable here NEVER drops, use VFXToggle"
 					% described.get("animation_flags", 0)) if held else " - one-shot activity"
@@ -1548,32 +1722,98 @@ class MainWindow(window.MainWindow):
 		except Exception as error:
 			self.showerror(str(error))
 
+	def current_effect_activity(self):
+		data = self.effect_activity.currentData()
+		if isinstance(data, (tuple, list)) and len(data) == 3:
+			return int(data[0]), int(data[1]), str(data[2])
+		text = self.effect_activity.currentText().strip()
+		return None, None, text
+
 	def load_effect_curve(self):
 		items = self.effect_list.selectedItems()
 		if not items:
 			return
-		name = items[0].text(0)
+		item = items[0]
+		kind = item.data(0, QtCore.Qt.UserRole) or "stream"
+		identity = item.data(0, QtCore.Qt.UserRole + 1) or self.current_effect_activity()
+		name = item.data(0, QtCore.Qt.UserRole + 2) or item.text(0)
+		requested_target = (identity, name)
+		if self.effects_dirty:
+			if self.effect_loaded_target != requested_target:
+				# Selection has already moved by the time this signal runs. Put it
+				# back on the curve whose dirty points are still displayed.
+				self.effect_list.blockSignals(True)
+				try:
+					self.effect_list.clearSelection()
+					iterator = QtWidgets.QTreeWidgetItemIterator(self.effect_list)
+					while iterator.value():
+						candidate = iterator.value()
+						candidate_identity = (
+							candidate.data(0, QtCore.Qt.UserRole + 1)
+							or self.current_effect_activity())
+						candidate_name = (
+							candidate.data(0, QtCore.Qt.UserRole + 2)
+							or candidate.text(0))
+						if (candidate_identity, candidate_name) == self.effect_loaded_target:
+							candidate.setSelected(True)
+							self.effect_list.setCurrentItem(candidate)
+							break
+						iterator += 1
+				finally:
+					self.effect_list.blockSignals(False)
+				self.showerror(
+					"This curve has unsaved edits. Write it or click Discard curve edits "
+					"before selecting another datastream.")
+			return
+		if kind == "usage":
+			for index in range(self.effect_activity.count()):
+				if self.effect_activity.itemData(index) == identity:
+					self.effect_activity.setCurrentIndex(index)
+					break
 		self.effect_name.setText(name)
-		self.effect_type.setEditText(items[0].text(1))
+		self.effect_type.setEditText(item.text(1))
+		self.effect_loaded_target = None
+		self.audio_scan_identity = None
+		self.effect_set_button.setEnabled(False)
 		try:
 			points = read_data_stream_curve(
-				self.source_path(), self.effect_activity.currentText().strip(),
-				name, DEFAULT_GAME)
+				self.source_path(), identity[2], name, DEFAULT_GAME,
+				activity_address=identity[:2] if identity[0] is not None else None)
 			if points:
-				self.curve_editor.set_points(points)
+				self.curve_editor.set_points(points, record=False)
+				self.curve_editor._undo.clear()
+				self.curve_editor._redo.clear()
+				self.effects_dirty = False
+				self.effect_loaded_target = (identity, name)
+				self.effect_set_button.setEnabled(True)
 		except Exception as error:
+			self.curve_editor.set_points([], record=False)
+			self.curve_editor._undo.clear()
+			self.curve_editor._redo.clear()
+			self.effects_dirty = False
 			logging.warning("Could not read curve for %s: %s" % (name, error))
+
+	def discard_effect_curve_edits(self):
+		"""Explicitly discard the displayed draft before navigation is allowed."""
+		if not self.effects_dirty:
+			return
+		self.effects_dirty = False
+		self.curve_editor._undo.clear()
+		self.curve_editor._redo.clear()
+		MainWindow.load_effect_curve(self)
 
 	def apply_effect_growth(self):
 		try:
+			identity = self.current_effect_activity()
 			report = grow_data_stream(
 				self.source_path(), self.output_path(),
-				self.effect_activity.currentText().strip(),
+				identity[2],
 				self.effect_name.text().strip(),
 				self.effect_type.currentText().strip(),
 				curve_points=list(self.curve_editor.points),
 				curve_type=curve_type_for(self.effect_type.currentText().strip()),
-				game=DEFAULT_GAME)
+				game=DEFAULT_GAME,
+				activity_address=identity[:2] if identity[0] is not None else None)
 
 			message = ("Added %s to %s: %d -> %d datastreams, +%d fragments"
 					   % (report.ds_name, report.activity, report.old_count,
@@ -1595,6 +1835,10 @@ class MainWindow(window.MainWindow):
 					self.effect_list,
 					[row["activity"], row["type"],
 					 "%d  %s" % (row["curve_type"], "HELD" if row["held"] else "one-shot")])
+				identity = (row["activity_pool"], row["activity_offset"], row["activity"])
+				item.setData(0, QtCore.Qt.UserRole, "usage")
+				item.setData(0, QtCore.Qt.UserRole + 1, identity)
+				item.setData(0, QtCore.Qt.UserRole + 2, self.effect_name.text().strip())
 				if row["held"] and row["type"] != "VFXToggle":
 					item.setForeground(2, QtGui.QBrush(QtGui.QColor("#C6402A")))
 			bad = [r for r in rows if r["held"] and r["type"] != "VFXToggle"]
@@ -1622,13 +1866,18 @@ class MainWindow(window.MainWindow):
 
 	def apply_effect_curve(self):
 		try:
+			if self.effect_loaded_target is None:
+				raise ValueError("Select and successfully load a datastream curve before writing")
+			identity, loaded_name = self.effect_loaded_target
+			if loaded_name != self.effect_name.text().strip():
+				raise ValueError("The datastream name differs from the loaded curve target")
 			ds_type = self.effect_type.currentText().strip()
 			result = set_data_stream_curve(
-				self.source_path(), self.output_path(),
-				self.effect_activity.currentText().strip(),
+				self.source_path(), self.output_path(), identity[2],
 				self.effect_name.text().strip(),
 				list(self.curve_editor.points), DEFAULT_GAME,
-				ds_type=ds_type, curve_type=curve_type_for(ds_type))
+				ds_type=ds_type, curve_type=curve_type_for(ds_type),
+				activity_address=identity[:2])
 			message = ("Wrote a %d-point curve onto %s / %s as %s"
 					   % (len(result["points"]), result["activity"],
 						  result["ds_name"], result["type"]))
@@ -1659,9 +1908,17 @@ class MainWindow(window.MainWindow):
 		self.apply_plan_button = QtWidgets.QPushButton("Apply queued patch plan to staged family")
 		self.apply_plan_button.clicked.connect(self.apply_plan)
 		layout.addWidget(self.apply_plan_button)
+		self.continue_button = QtWidgets.QPushButton("Continue from staged result")
+		self.continue_button.setToolTip(
+			"Keep the staged result, copy it into a new editing step, and reload. "
+			"Clears the old patch queue and selections; apply desired edits first.")
+		self.continue_button.clicked.connect(self.continue_from_staged)
+		layout.addWidget(self.continue_button)
 		warning = QtWidgets.QLabel(
-			"This editor does not install into the live game. Queue every desired value first, then Apply "
-			"once: the staged main OVL is rebuilt from the source with the complete queue atomically."
+			"Apply writes the complete queued edit from the current source. To add another operation "
+			"without losing that result, click Continue from staged result first. This preserves the "
+			"previous files and reloads a fresh editing step, clearing old queued edits and selections. "
+			"This editor does not install into the live game."
 		)
 		warning.setWordWrap(True)
 		layout.addWidget(warning)
@@ -1684,7 +1941,8 @@ class MainWindow(window.MainWindow):
 		try:
 			name = self.name_edit.text().strip() or None
 			_ovl_a, loader_a = load_motiongraph(self.source_path(), name, DEFAULT_GAME)
-			_ovl_b, loader_b = load_motiongraph(self.output_path(), name, DEFAULT_GAME)
+			_ovl_b, loader_b = load_motiongraph(
+				self.output_path(allow_existing_result=True), name, DEFAULT_GAME)
 			delta = diff_census(census(loader_a), census(loader_b))
 		except Exception as exc:
 			logging.warning(f"census guard could not run after {label}: {exc}")
@@ -1716,19 +1974,37 @@ class MainWindow(window.MainWindow):
 				f"{label}: census guard OK (+{added} / -{removed})", 10000)
 		return delta
 
-	def source_path(self) -> Path:
+	def requested_source_path(self) -> Path:
 		path = Path(self.source_edit.text().strip())
 		if not path.is_file():
 			raise ValueError("Choose an existing source OVL")
-		return path
+		return path.resolve()
 
-	def output_path(self) -> Path:
+	def source_path(self) -> Path:
+		requested = self.requested_source_path()
+		if self.loaded_identity is None:
+			raise ValueError("Load and analyse the selected source first")
+		loaded, graph, expected_hash, _generation = self.loaded_identity
+		if requested != loaded or self.name_edit.text().strip().lower() != graph.lower():
+			raise ValueError("The requested source differs from the loaded analysis; click Load")
+		actual_hash = hashlib.sha256(loaded.read_bytes()).hexdigest()
+		if actual_hash != expected_hash:
+			raise ValueError("The loaded source changed outside the editor; reload before editing")
+		return loaded
+
+	def output_path(self, allow_existing_result=False) -> Path:
 		stage = Path(self.stage_edit.text().strip())
 		if not stage.is_dir():
 			raise ValueError("Copy the full family to a stage directory first")
 		output = stage / self.source_path().name
 		if not output.is_file():
 			raise ValueError(f"Staged main OVL is missing: {output}")
+		if not allow_existing_result and self.loaded_identity is not None:
+			if hashlib.sha256(output.read_bytes()).hexdigest() != self.loaded_identity[2]:
+				raise ValueError(
+					"The stage already contains a result newer than the loaded source; "
+					"use Continue from staged result before another operation"
+				)
 		return output
 
 	def browse_source(self):
@@ -1742,26 +2018,35 @@ class MainWindow(window.MainWindow):
 			self.stage_edit.setText(path)
 
 	def load_source(self):
+		if self.plan or getattr(self, "effects_dirty", False):
+			self.showerror("Apply/save and clear queued edits, or discard the dirty Effects draft, before loading another source")
+			return
 		try:
-			source = self.source_path()
+			source = self.requested_source_path()
 		except Exception as exc:
 			self.showerror(str(exc))
 			return
 		self.load_button.setEnabled(False)
 		self.status_bar.showMessage("Loading and analysing motiongraph…")
 		logging.info(f"Loading and analysing motiongraph family: {source}")
+		self.editor_generation += 1
+		generation = self.editor_generation
 		worker = self.run_background_task(
-			_load_reports, self.loaded_source, source, self.name_edit.text().strip() or None
+			_load_reports_identity, self.loaded_source, source,
+			self.name_edit.text().strip() or None, generation
 		)
 		worker.signals.finished.connect(lambda: self.load_button.setEnabled(True))
 
 	def loaded_source(self, result):
-		if self.plan:
-			self.plan = None
-			self.refresh_patch_queue()
-			logging.info("Cleared patch queue because a new source motiongraph was loaded")
+		generation, source, graph, source_hash, reports = result
+		if generation != self.editor_generation:
+			logging.info("Ignored a completed load from editor generation %d", generation)
+			return
+		self.invalidate_source_dependent_state()
 		(self.ovl, self.loader, _state_text, self.state_rows, state_stats,
-		 decision_text, decision_stats, self.decision_graph_data) = result
+		 decision_text, decision_stats, self.decision_graph_data) = reports
+		self.loaded_identity = (Path(source).resolve(), graph, source_hash, generation)
+		self.source_edit.setText(str(source))
 		self.name_edit.setText(self.loader.name)
 		self.loaded_label.setText(
 			f"{state_stats.states} states / {decision_stats.decision_nodes} decision nodes"
@@ -1785,6 +2070,28 @@ class MainWindow(window.MainWindow):
 			f"Loaded {self.loader.name}: {state_stats.states} states, "
 			f"{decision_stats.decision_nodes} decision nodes"
 		)
+
+	def invalidate_source_dependent_state(self):
+		"""Clear every address-bearing result when a new source is accepted."""
+		self.field_rows = []
+		if hasattr(self, "field_table"):
+			self.field_table.setRowCount(0)
+		self.activity_address_filter = None
+		self.activity_tree_state = None
+		self.clone_redirect_source = None
+		self.scan_generation = None
+		self.effect_loaded_target = None
+		self.effect_draft = None
+		self.stage_has_result = False
+		self.audio_scan_identity = None
+		self.activity_node_items = {}
+		for name in ("activity_tree", "chooser_tree", "decision_tree", "audio_list", "effect_list"):
+			widget = getattr(self, name, None)
+			if widget is not None:
+				widget.clear()
+		if hasattr(self, "effect_activity"):
+			self.effect_activity.clear()
+		self.effect_loaded_target = None
 
 	def populate_graph(self):
 		self.graph_scene.clear()
@@ -2297,6 +2604,11 @@ class MainWindow(window.MainWindow):
 			f"(pool {address[0]}, offset {address[1]})"
 		)
 		self.clone_usage_label.setText(", ".join(str(index) for index in usage) or "None")
+		# the Clip Retarget tab's single-activity control reads the same selection
+		self.single_clip_label.setText(
+			f"{label or '(unnamed)'} — {activity_type} "
+			f"(pool {address[0]}, offset {address[1]})"
+		)
 		preferred_scope = "occurrence" if self.clone_redirect_source else "all"
 		self.clone_redirect_scope.setCurrentIndex(
 			self.clone_redirect_scope.findData(preferred_scope)
@@ -2416,8 +2728,11 @@ class MainWindow(window.MainWindow):
 		else:
 			scope_message = "entire motiongraph"
 		logging.info(f"Locating and byte-verifying fields across {scope_message}")
+		generation = self.editor_generation
+		identity = self.loaded_identity
 		worker = self.run_background_task(
-			locate_fields, self.scanned_fields, self.source_path(), self.name_edit.text().strip(),
+			_scan_fields_identity, self.scanned_fields, generation, identity,
+			self.source_path(), self.name_edit.text().strip(),
 			DEFAULT_GAME, self.activity_filter.text().strip() or None,
 			self.type_filter.text().strip() or None, self.field_filter.text().strip() or None,
 			activity_pool, activity_offset, activity_addresses,
@@ -2425,7 +2740,11 @@ class MainWindow(window.MainWindow):
 		worker.signals.finished.connect(lambda: self.scan_button.setEnabled(True))
 
 	def scanned_fields(self, result):
-		rows, mismatches = result
+		generation, identity, scan_result = result
+		if generation != self.editor_generation or identity != self.loaded_identity:
+			logging.info("Ignored stale field scan from editor generation %d", generation)
+			return
+		rows, mismatches = scan_result
 		self.field_rows = []
 		self.field_table.setRowCount(0)
 		for owner in rows:
@@ -2570,6 +2889,59 @@ class MainWindow(window.MainWindow):
 		except Exception as exc:
 			self.showerror(str(exc))
 
+	def continue_from_staged(self):
+		if self.active_workers:
+			self.showerror("Wait for the current operation to finish first")
+			return
+		if self.plan or getattr(self, "effects_dirty", False):
+			self.showerror("Apply/save and clear queued edits, or discard the dirty Effects draft, before continuing")
+			return
+		try:
+			result = self.output_path(allow_existing_result=True)
+			name = self.name_edit.text().strip() or None
+		except Exception as exc:
+			self.showerror(str(exc))
+			return
+		self.body.setEnabled(False)
+		self.status_bar.showMessage("Copying and checking the next editing step...")
+		worker = self.run_background_task(prepare_next_stage, self.continued_stage, result, name)
+		worker.signals.finished.connect(lambda: self.body.setEnabled(True))
+
+	def continued_stage(self, result):
+		source, stage, outputs, reports = result
+		self.source_edit.setText(str(source))
+		self.stage_edit.setText(str(stage))
+		self.stage_files.setPlainText("\n".join(str(path) for path in outputs))
+		# Old addresses and queue hashes belong to the previous source generation.
+		self.plan = None
+		self.refresh_patch_queue()
+		self.field_rows = []
+		self.field_table.setRowCount(0)
+		self.activity_address_filter = None
+		self.activity_tree_state = None
+		self.clone_redirect_source = None
+		self.scan_generation = None
+		self.effect_loaded_target = None
+		self.effect_draft = None
+		self.stage_has_result = False
+		self.audio_scan_identity = None
+		self.activity_node_items = {}
+		for tree in (self.activity_tree, self.chooser_tree, self.decision_tree, self.audio_list):
+			tree.clear()
+		self.effect_activity.clear()
+		self.effect_list.clear()
+		self.effect_name.clear()
+		self.activity_filter.clear()
+		self.type_filter.clear()
+		self.field_filter.clear()
+		self.effects_dirty = False
+		self.editor_generation += 1
+		generation = self.editor_generation
+		source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+		self.loaded_source((generation, source, reports[1].name, source_hash, reports))
+		self.status_bar.showMessage("Ready for the next edit. Previous result preserved; select and scan again.", 15000)
+		logging.info(f"Continued editing from {source}; next output: {stage}")
+
 	def apply_plan(self):
 		if not self.plan:
 			self.showerror("Add at least one edit to the patch queue first")
@@ -2585,7 +2957,10 @@ class MainWindow(window.MainWindow):
 			)
 			# Fixed-width value edits inside existing slots: the object set must be
 			# untouched. A change here means the plan hit something structural.
-			self.census_guard("patch plan", expect_added=0, expect_removed=0)
+			delta = self.census_guard("patch plan", expect_added=0, expect_removed=0)
+			if delta is not None and not delta["added"] and not delta["removed"]:
+				self.plan = None
+				self.refresh_patch_queue()
 		except Exception as exc:
 			self.showerror(str(exc))
 
@@ -2698,6 +3073,24 @@ class MainWindow(window.MainWindow):
 		if path:
 			self.audio_out.setText(path)
 
+	def browse_audio_sounds(self):
+		path = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder containing custom WEM files")
+		if path:
+			self.audio_sounds.setText(path)
+
+	def browse_audio_marker(self):
+		path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Marker media OVL", "", "OVL (*.ovl)")
+		if path:
+			self.audio_marker.setText(path)
+
+	def open_audio_output(self, filename):
+		folder = self.audio_out.text().strip()
+		path = Path(folder) / filename
+		if not folder or not path.exists():
+			self.showerror("Choose an output folder and complete a build first")
+			return
+		QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path.resolve())))
+
 	def _audio_kit_dir(self):
 		"""Where JWE3 Audio Kit lives, relative to this cobra checkout."""
 		here = Path(__file__).resolve().parent
@@ -2707,12 +3100,15 @@ class MainWindow(window.MainWindow):
 				return candidate
 		return None
 
-	def build_species_audio(self):
+	def build_species_audio(self, _checked=False, baseline=False):
 		"""Run the audio kit's builder for the donor/prefix already entered above.
 
 		Driven as a subprocess rather than imported: the builder is a verified
 		pipeline with an argparse entry point, and shelling out keeps it that way.
 		"""
+		if self.active_workers:
+			self.showerror("Wait for the current operation to finish first")
+			return
 		try:
 			kit = self._audio_kit_dir()
 			if kit is None:
@@ -2722,33 +3118,24 @@ class MainWindow(window.MainWindow):
 			prefix = self.audio_prefix.text().strip()
 			game = self.audio_game.text().strip()
 			out = self.audio_out.text().strip()
-			missing = [n for n, v in (("donor species", donor), ("new prefix", prefix),
-									  ("game folder", game), ("output folder", out)) if not v]
-			if missing:
-				raise ValueError("Fill in: " + ", ".join(missing))
-			cmd = [sys.executable, str(kit / "build_species_audio.py"),
-				   "--donor", donor, "--prefix", prefix, "--game", game, "--out", out]
-			sound_mod = self.audio_soundmod.text().strip()
-			if sound_mod:
-				cmd += ["--sound-mod", sound_mod]
+			cmd = audio_build_command(kit, Path(__file__).resolve().parent, donor, prefix, game, out,
+				self.audio_soundmod.text().strip(), self.audio_sounds.text().strip(),
+				self.audio_marker.text().strip(), baseline)
 			logging.info("Building audio banks: %s" % " ".join(cmd))
-			result = subprocess.run(cmd, cwd=str(kit), capture_output=True, text=True)
-			for line in (result.stdout or "").splitlines():
-				logging.info("  %s" % line)
-			if result.returncode != 0:
-				for line in (result.stderr or "").splitlines()[-12:]:
-					logging.error("  %s" % line)
-				raise ValueError("Builder failed (exit %d) - see the log"
-								 % result.returncode)
-			produced = sorted(p.name for p in Path(out).glob("*")
-							  if p.suffix in (".bnk", ".add", ".json"))
-			message = ("Built %s. Copy the .bnk files into <Mod>/Audio/, then run "
-					   "merge_registry.bat - an unregistered event is NEVER posted."
-					   % ", ".join(produced))
-			self.status_bar.showMessage(message, 25000)
-			logging.info(message)
+			self.body.setEnabled(False)
+			self.status_bar.showMessage("Building audio banks; output will appear in the log when finished...")
+			worker = self.run_background_task(run_audio_build, self.audio_build_finished, cmd, kit)
+			worker.signals.finished.connect(lambda: self.body.setEnabled(True))
 		except Exception as error:
+			self.body.setEnabled(True)
 			self.showerror(str(error))
+
+	def audio_build_finished(self, result):
+		out, names, log = result
+		logging.info(log)
+		message = f"Built {', '.join(names)} in {out}. Copy both banks AND .wmetasb.add into <Mod>/Audio/, then merge."
+		self.status_bar.showMessage(message, 25000)
+		logging.info(message)
 
 	def scan_audio_events(self):
 		try:
@@ -2758,12 +3145,6 @@ class MainWindow(window.MainWindow):
 				raise ValueError("Enter the donor species, e.g. Indoraptor")
 			if not prefix:
 				raise ValueError("Enter your new prefix, e.g. Indocapi")
-			if len(prefix) > len(donor):
-				raise ValueError(
-					"'%s' is longer than '%s'. A renamed string has to fit its existing "
-					"allocation, so the new prefix must be no longer than the donor's."
-					% (prefix, donor)
-				)
 			game_root = Path(self.audio_game.text().strip())
 			if not (game_root / "Win64" / "ovldata").is_dir():
 				raise ValueError("Choose the game folder (the one containing Win64/ovldata)")
@@ -2774,6 +3155,8 @@ class MainWindow(window.MainWindow):
 				raise ValueError("No '%s_*' audio event names in this motiongraph" % donor)
 			owned_ids = audio_events.donor_event_ids(game_root, donor, DEFAULT_GAME)
 			classified = audio_events.classify(names, donor, owned_ids)
+			self.audio_scan_identity = (self.loaded_identity, donor, prefix,
+				str(game_root.resolve()))
 
 			self.audio_list.clear()
 			safe = 0
@@ -2806,6 +3189,9 @@ class MainWindow(window.MainWindow):
 		try:
 			donor = self.audio_donor.text().strip()
 			prefix = self.audio_prefix.text().strip()
+			game_root = Path(self.audio_game.text().strip()).resolve()
+			if self.audio_scan_identity != (self.loaded_identity, donor, prefix, str(game_root)):
+				raise ValueError("Audio preview is stale; scan again after changing source, donor, prefix, or game folder")
 			pairs = []
 			for index in range(self.audio_list.topLevelItemCount()):
 				item = self.audio_list.topLevelItem(index)
@@ -2819,37 +3205,11 @@ class MainWindow(window.MainWindow):
 				raise ValueError("Scan first, then tick at least one event")
 			pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
 
-			report = patch_string_slots(
-				self.source_path(), self.output_path(), pairs, game=DEFAULT_GAME
-			)
-			message = ("Renamed %d audio events in one pass (%d changed bytes); "
-					   "staged family verified" % (report.renamed, report.changed_bytes))
-
-			# Names too long for their existing slot cannot be patched in place.
-			# Relocate those instead: allocate the longer string and repoint every
-			# fragment. Done as a second pass so short names stay cheap.
-			too_long = [(name, dict(pairs).get(name)) for name, why in report.skipped
-						if "slot has" in why or "needs" in why]
-			if too_long:
-				staged = self.output_path()
-				with tempfile.TemporaryDirectory(prefix="audio_reloc_") as tmp:
-					carry = Path(tmp) / staged.name
-					shutil.copy2(staged, carry)
-					for extra in staged.parent.glob(staged.stem + ".ovs.*"):
-						shutil.copy2(extra, Path(tmp) / extra.name)
-					moved = relocate_strings(carry, staged, too_long)
-				message += ("; %d too long for their slot were RELOCATED "
-							"(%d fragments repointed)"
-							% (moved.relocated, moved.fragments_repointed))
-				for name, why in moved.skipped:
-					logging.warning("Audio relocate skipped %s: %s" % (name, why))
-
-			remaining = [(n, w) for n, w in report.skipped
-						 if not ("slot has" in w or "needs" in w)]
-			if remaining:
-				message += " - %d skipped" % len(remaining)
-				for name, why in remaining:
-					logging.warning("Audio rename skipped %s: %s" % (name, why))
+			report = apply_string_renames(
+				self.source_path(), self.output_path(), pairs, game=DEFAULT_GAME)
+			message = ("Renamed %d audio events in place and relocated %d; "
+						   "%d fragments repointed; staged family verified"
+						   % (report.in_place, report.relocated, report.fragments_repointed))
 			self.status_bar.showMessage(message, 15000)
 			logging.info(message)
 			self.census_guard("audio event rename", expect_added=0, expect_removed=0)
@@ -2977,10 +3337,15 @@ class MainWindow(window.MainWindow):
 			clip = self.chooser_add_clip.text().strip()
 			if not clip:
 				raise ValueError("Enter the full clip name to add, e.g. Species$Rest03")
+			# Re-weight in the SAME pass. As a separate operation it would re-read
+			# `source` and discard the clip we just added.
+			text = self.chooser_add_weights.text().strip()
+			weights = [int(x) for x in text.replace(" ", "").split(",") if x] if text else None
 			report = grow_random_animation_chooser(
 				self.source_path(), self.output_path(), pool, offset, clip,
 				weight=self.chooser_add_weight.value(),
-				name=self.name_edit.text().strip() or None, game=DEFAULT_GAME)
+				name=self.name_edit.text().strip() or None, game=DEFAULT_GAME,
+				weights=weights)
 			self.status_bar.showMessage(f"Added '{clip}' to chooser {pool}:{offset}", 12000)
 			logging.info(f"Chooser {pool}:{offset} grown with '{clip}': {report}")
 			# Growth relocates the entry array and may append a string; the object

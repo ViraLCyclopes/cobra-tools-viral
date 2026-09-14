@@ -65,6 +65,70 @@ def clip_names(filepath: str) -> list | None:
 MAX_LISTED = 500
 
 
+def draw_splice_plan(layout, source_folder: str, action_source: str = "CHANGED") -> None:
+    """Draw which actions will be spliced into which bundle.
+
+    The splice exporter routes each action by the `manis` stamp its importer left
+    on it, so unlike the import dialog the user never picks a bundle - which made
+    the export dialog silent about where anything was going. This mirrors the
+    candidate selection in `export_splice.save` so the panel shows the real plan.
+
+    Deliberately cheap: a file browser redraws constantly, so this only does dict
+    lookups, `os.path.isfile`, and the cached `clip_names`. It never samples an
+    action, so it cannot show which clips actually DIFFER - that test requires
+    sampling and only happens at export time.
+    """
+    import bpy
+
+    box = layout.box()
+    box.label(text="Splice plan", icon='EXPORT')
+
+    folder = bpy.path.abspath(source_folder or "")
+    if not folder or not os.path.isdir(folder):
+        box.label(text="Set 'Source Bundles' to the vanilla .manis folder", icon='ERROR')
+        return
+
+    if action_source == "ACTIVE":
+        ob = bpy.context.object
+        anim = getattr(ob, "animation_data", None) if ob else None
+        active = getattr(anim, "action", None)
+        candidates = [active] if active else []
+    elif action_source == "SELECTED":
+        candidates = [a for a in bpy.data.actions if a.get("cobra_splice")]
+    else:
+        candidates = list(bpy.data.actions)
+
+    stamped = [a for a in candidates if a is not None and a.get("manis")]
+    unstamped = [a for a in candidates if a is not None and not a.get("manis")]
+
+    if not stamped:
+        box.label(text="No actions carry a bundle stamp - re-import them", icon='ERROR')
+        return
+
+    by_bundle: dict = {}
+    for action in stamped:
+        by_bundle.setdefault(action.get("manis"), []).append(action.name)
+
+    for bundle in sorted(by_bundle):
+        present = os.path.isfile(os.path.join(folder, bundle))
+        row = box.row()
+        row.label(text=bundle, icon='FILE' if present else 'ERROR')
+        names = by_bundle[bundle]
+        col = box.column(align=True)
+        if not present:
+            col.label(text="not in the source folder - these clips are SKIPPED")
+        for name in sorted(names)[:MAX_LISTED]:
+            col.label(text="    " + (name.split("$")[-1] if "$" in name else name))
+        if len(names) > MAX_LISTED:
+            col.label(text=f"    ... and {len(names) - MAX_LISTED} more")
+
+    if unstamped:
+        box.label(text=f"{len(unstamped)} action(s) have no stamp and are ignored",
+                  icon='INFO')
+    if action_source == "CHANGED":
+        box.label(text="'Changed Only' writes just the clips that differ", icon='INFO')
+
+
 def draw_clip_list(layout, filepath: str) -> None:
     """Draw the clip names of `filepath` into a file-browser side panel."""
     box = layout.box()

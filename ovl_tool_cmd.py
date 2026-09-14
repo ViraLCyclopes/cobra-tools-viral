@@ -616,11 +616,22 @@ def cmd_motiongraph_chooser(args: argparse.Namespace) -> None:
     except ValueError:
         die(f"--chooser must look like POOL:OFFSET, got {args.chooser!r}")
 
+    parsed_weights = None
+    if args.weights:
+        try:
+            parsed_weights = [int(x) for x in str(args.weights).replace(" ", "").split(",") if x]
+        except ValueError:
+            die(f"--weights must be a comma-separated integer list, got {args.weights!r}")
+
     if args.add:
+        # --add and --weights must be ONE pass. set_chooser_weights refuses
+        # source == output, so the old "grow, then re-weight" chain re-read the
+        # original OVL and silently discarded the added clip.
         try:
             report = grow_random_animation_chooser(
                 source, output, chooser_pool, chooser_offset, args.add,
-                weight=args.weight, name=args.name, game=game)
+                weight=args.weight, name=args.name, game=game,
+                weights=parsed_weights)
         except Exception as exc:
             die(f"could not add the clip: {exc}")
         logging.success(f"{report.entries_before} -> {report.entries_after} clips; "
@@ -628,21 +639,20 @@ def cmd_motiongraph_chooser(args: argparse.Namespace) -> None:
                         f"+{report.pool_growth} bytes")
         for clip in report.names:
             print("   ", clip)
+        if parsed_weights:
+            total = sum(parsed_weights) or 1
+            logging.success("weights applied in the same pass: "
+                            + "  ".join(f"{100.0 * w / total:.1f}%" for w in parsed_weights))
         logging.warning("Cobra reload is not proof - verify with motiongraph-census "
                         "--against and then in game")
-        source = output
+        return
 
-    if args.weights:
-        try:
-            weights = [int(x) for x in str(args.weights).replace(" ", "").split(",") if x]
-        except ValueError:
-            die(f"--weights must be a comma-separated integer list, got {args.weights!r}")
-        if source != output and not output.is_file():
+    if parsed_weights:
+        if not output.is_file():
             die("stage the complete OVL family at --output first")
         try:
-            row = set_chooser_weights(source if source != output else args.ovl,
-                                      output, chooser_pool, chooser_offset,
-                                      weights, args.name, game)
+            row = set_chooser_weights(source, output, chooser_pool, chooser_offset,
+                                      parsed_weights, args.name, game)
         except Exception as exc:
             die(f"could not set weights: {exc}")
         logging.success("weights updated")
@@ -663,8 +673,8 @@ def cmd_motiongraph_decision(args: argparse.Namespace) -> None:
     """
     from pathlib import Path
     from source.formats.motiongraph.decision_growth import (
-        add_state, grow_decision_chooser, inbound_count, list_decision_choosers,
-        list_states)
+        add_state, add_state_and_route, grow_decision_chooser, inbound_count,
+        list_decision_choosers, list_states, set_activity_clip)
 
     game = resolve_game_label(args.game)
     source = Path(args.ovl).resolve()
@@ -704,35 +714,70 @@ def cmd_motiongraph_decision(args: argparse.Namespace) -> None:
         die("--add-state and --route-to write a file; pass -o/--output (a staged family)")
     output = Path(args.output).resolve()
 
-    if args.add_state is not None:
+    if args.set_clip is not None:
+        if args.activity is None:
+            die("--set-clip needs --activity POOL:OFFSET (the Activity wrapper address)")
         try:
-            report = add_state(source, output, args.add_state, args.name, game)
+            pool_text, offset_text = str(args.activity).split(":")
+            act_pool, act_offset = int(pool_text), int(offset_text)
+        except ValueError:
+            die(f"--activity must look like POOL:OFFSET, got {args.activity!r}")
+        if not args.output:
+            die("--set-clip writes a file; pass -o/--output (a staged family)")
+        try:
+            report = set_activity_clip(source, Path(args.output).resolve(),
+                                       act_pool, act_offset, args.set_clip,
+                                       args.name, game)
         except Exception as exc:
-            die(f"could not add a state: {exc}")
-        logging.success(f"states {report.old_count} -> {report.new_count}; "
-                        f"new STATE[{report.new_state_index}] twinned on "
-                        f"[{report.twin_state}] at {report.new_state_at[0]}:"
-                        f"{report.new_state_at[1]}; +{report.pool_growth} bytes, "
-                        f"+{report.added_fragments} fragments, "
-                        f"{report.moved_end_sentinels} sentinels moved")
-        logging.warning("The new state has NO inbound edge yet - it is dormant until "
-                        "you --route-to it")
-        source = output
+            die(f"could not retarget the clip: {exc}")
+        logging.success(f"activity {report.activity[0]}:{report.activity[1]}  "
+                        f"{report.old_clip} -> {report.new_clip}  "
+                        f"({'allocated' if report.allocated else 'reused'} at "
+                        f"{report.string_at[0]}:{report.string_at[1]}, "
+                        f"+{report.pool_growth} bytes)")
+        logging.warning("This writes the REFERENCE, not the animation - the clip must "
+                        "exist in the .manis bundles or it resolves to nothing")
+        return
 
-    if args.route_to is not None:
-        if args.chooser is None:
-            die("--route-to needs --chooser POOL:OFFSET (see the plain listing)")
+    node_pool = node_offset = None
+    if args.chooser is not None:
         try:
             pool_text, offset_text = str(args.chooser).split(":")
             node_pool, node_offset = int(pool_text), int(offset_text)
         except ValueError:
             die(f"--chooser must look like POOL:OFFSET, got {args.chooser!r}")
-        if source != output and not output.is_file():
-            die("stage the complete OVL family at --output first")
+    weight = args.weight if args.weight else 1
+
+    # Both at once is the normal case, and it MUST be one pass: each operation
+    # reads `source`, so two calls would have the second discard the first.
+    if args.add_state is not None and args.route_to is None:
+        if node_pool is None:
+            die("--add-state needs --chooser POOL:OFFSET to route the new state, or pass "
+                "--dormant to deliberately create an unreachable state")
+        try:
+            report = add_state_and_route(source, output, args.add_state,
+                                         node_pool, node_offset, weight, args.name, game)
+        except Exception as exc:
+            die(f"could not add the state: {exc}")
+        logging.success(f"states {report.old_count} -> {report.new_count}; "
+                        f"new STATE[{report.new_state_index}] twinned on "
+                        f"[{report.twin_state}] at {report.new_state_at[0]}:"
+                        f"{report.new_state_at[1]}; routed from chooser "
+                        f"{node_pool}:{node_offset} at weight {weight} "
+                        f"({report.route['old_results']} -> {report.route['new_results']} "
+                        f"results); +{report.pool_growth} bytes, "
+                        f"+{report.added_fragments} fragments, "
+                        f"{report.moved_end_sentinels} sentinels moved")
+    elif args.add_state is not None:
+        die("pass --add-state with --chooser (it routes automatically); combining "
+            "--add-state with --route-to in one run is not supported")
+    else:
+        if node_pool is None:
+            die("--route-to needs --chooser POOL:OFFSET (see the plain listing)")
         try:
             report = grow_decision_chooser(
                 source, output, node_pool, node_offset, args.route_to,
-                weight=args.weight if args.weight else 1, name=args.name, game=game)
+                weight=weight, name=args.name, game=game)
         except Exception as exc:
             die(f"could not grow the decision chooser: {exc}")
         logging.success(f"results {report.old_results} -> {report.new_results} "
@@ -1200,13 +1245,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_mgn.add_argument("--chooser", help="Target chooser as POOL:OFFSET, from the listing.")
     p_mgn.add_argument(
         "--add-state", type=int, metavar="TWIN",
-        help="Register a new state twinned on this state index. Dormant until routed to.",
+        help="Add a state twinned on this index AND route to it from --chooser, in one pass. "
+             "A state with no inbound edge is dormant, so routing is not optional.",
     )
     p_mgn.add_argument(
         "--route-to", type=int, metavar="STATE",
-        help="Add a chooser result pointing at this state index. Needs --chooser.",
+        help="Add a chooser result pointing at an EXISTING state index. Needs --chooser.",
     )
     p_mgn.add_argument("--weight", type=int, help="Weight for the added result (default 1).")
+    p_mgn.add_argument("--activity", help="Activity wrapper as POOL:OFFSET, for --set-clip.")
+    p_mgn.add_argument(
+        "--set-clip", metavar="NAME",
+        help="Point ONE AnimationActivity at this clip name, allocating it if new. "
+             "Writes the reference only - the clip must exist in the .manis bundles.",
+    )
     p_mgn.add_argument("-o", "--output", help="Staged same-named OVL to write.")
     p_mgn.add_argument("--name", help="Internal .motiongraph name; auto-detected.")
     p_mgn.add_argument(

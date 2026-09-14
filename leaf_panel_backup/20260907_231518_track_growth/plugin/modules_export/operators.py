@@ -248,10 +248,12 @@ class ExportManisSplice(ExportOp):
                     "poses them. Without this such a bone exports cleanly and "
                     "silently does not move in game")
     grow_channels: BoolProperty(
-        name="Add Missing Channels and Tracks", default=True,
-        description="Add missing channels and create new ori/pos tracks for custom "
-                    "bones using the supplied MS2 bind pose. New tracks rebuild the "
-                    "bundle database. New scale tracks are not supported")
+        name="Add Missing Channels", default=True,
+        description="Give the clip a channel for any bone you animated that it has "
+                    "no channel for at all. Without this such a bone is dropped "
+                    "SILENTLY - the export succeeds and it never moves in game. "
+                    "Costs no extra bytes and moves nothing; the bone must already "
+                    "have a track somewhere in this bundle")
 
     def draw(self, context):
         layout = self.layout

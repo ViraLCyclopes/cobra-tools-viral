@@ -2,6 +2,7 @@ import argparse
 import contextlib
 import os
 import sys
+import tempfile
 import time
 import logging
 
@@ -19,6 +20,8 @@ from generated.formats.manis.versions import games
 from generated.formats.ms2 import Ms2File
 from generated.formats.wsm.structs.WsmHeader import WsmHeader
 from source.formats.manis import inspect as manis_inspect
+from source.formats.manis.append import append_clip
+from source.formats.manis.database import locate_bulk
 from source.formats.manis.acl_patch import (
 	patch_constant,
 	patch_scalar_constant,
@@ -601,6 +604,22 @@ class MainWindow(window.MainWindow):
 			logging.exception("edit_handle")
 
 	def remove(self):
+		"""Remove clips or bone channels.
+
+		Removal only exists on the STRUCTURAL writer, which cannot reproduce a
+		compressed clip - saving after it drops every ACL blob in the bundle, not
+		just the one removed. `Duplicate` had the same trap until it was given a
+		byte-splice path; removal has no equivalent yet (it would be the mirror of
+		`append_clip`: drop the name, the ManiInfo and the ManiBlock, fix two
+		counts). Until then, say so before the user spends an edit on it.
+		"""
+		if self._is_compressed_bundle() and not self.ask_yes_no(
+				"Removal will destroy this bundle's compressed animation",
+				"Removing goes through the MANIS writer, which cannot reproduce compressed "
+				"clips - saving afterwards drops the ACL data for EVERY clip in this bundle, "
+				"not just the one you remove.\n\nThere is no byte-splice removal yet. "
+				"Remove anyway?"):
+			return
 		for item in self.tree.selectedItems():
 			names = self.get_parents(item)
 			if len(names) == 1:
@@ -619,13 +638,95 @@ class MainWindow(window.MainWindow):
 					self.handle_error("Removing file failed, see log!")
 		self.update_gui_table()
 
+	def _is_compressed_bundle(self) -> bool:
+		return any(bool(getattr(getattr(info, "dtype", None), "compression", 0))
+				   for info in self.manis_file.mani_infos)
+
+	def duplicate_compressed(self, donor: str, new_name: str) -> None:
+		"""Duplicate a clip by splicing bytes, leaving every ACL blob compressed.
+
+		`ManisFile.duplicate()` + the structural writer cannot reproduce a
+		compressed clip - it drops the ACL database and every blob, turning a
+		1.4 MB bundle into a 13.8 MB dtype-0 one. So on a compressed bundle we
+		take the same route the ACL value editor takes: patch `raw_data` and let
+		`save` write those bytes verbatim.
+
+		A clip is one name, one ManiInfo, one ManiBlock and two counts; the block
+		is copied whole, carrying its channel tables, ACL container, blobs and the
+		limb structure in the gap after it. Offsets are never stored absolutely,
+		so the splice is safe.
+
+		CAVEAT, and it is not settled: the copied ManiInfo still carries the
+		DONOR's ACL database binding, so the two clips share one database entry.
+		`append.py` says to rebuild through `manis_database_cmd` afterwards -
+		but that re-encodes every clip and drags the bundle under the stripped-set
+		contract. Whether a shared binding simply works has never been tested in
+		game. Verify before trusting it.
+		"""
+		if not self.raw_data:
+			raise ValueError("No raw bundle bytes loaded; reopen the file")
+		bulk = locate_bulk(self.raw_data)
+		if bulk is None:
+			raise ValueError(
+				"Could not locate the ACL bulk (low/medium tiers) by hash, so the end of "
+				"the keys buffer is unknown and a splice would corrupt the bundle")
+		self.raw_data = append_clip(self.raw_data, self.manis_file, donor, new_name,
+									bulk["low_offset"])
+		self.raw_modified = True
+		# the parsed structs are now stale - re-read them from the spliced bytes
+		with tempfile.NamedTemporaryFile(suffix=".manis", delete=False) as tmp:
+			tmp.write(self.raw_data)
+			tmp_path = tmp.name
+		try:
+			self.manis_file.load(tmp_path)
+		finally:
+			with contextlib.suppress(OSError):
+				os.remove(tmp_path)
+
 	def duplicate(self):
 		for item in self.tree.selectedItems():
 			names = self.get_parents(item)
 			if len(names) == 1:
 				mani_name, = names
+				new_name = f"{mani_name}_copy"
+				index = 2
+				while self.manis_file.name_used(new_name):
+					new_name = f"{mani_name}_copy{index}"
+					index += 1
+				text, ok = QtWidgets.QInputDialog.getText(
+					self, "Duplicate clip", f"New name for a copy of '{mani_name}':",
+					text=new_name)
+				if not ok:
+					return
+				new_name = text.strip().lower()      # clip names are lowercase
+				if not new_name:
+					self.showwarning("Enter a name for the duplicate")
+					return
+				if self.manis_file.name_used(new_name):
+					self.showwarning(f"{new_name} already exists in this MANIS!")
+					return
 				try:
-					self.manis_file.duplicate((mani_name, ))
+					if self._is_compressed_bundle():
+						self.duplicate_compressed(mani_name, new_name)
+						self.set_progress_message(
+							f"Spliced '{new_name}' from '{mani_name}', still compressed "
+							f"({len(self.raw_data):,} bytes)")
+						self.showwarning(
+							f"'{new_name}' shares '{mani_name}'s ACL database binding. "
+							f"append.py says to rebuild via manis_database_cmd, but that "
+							f"re-encodes every clip. Whether a shared binding works is "
+							f"UNTESTED - verify in game before relying on it."
+						)
+					else:
+						# duplicate() picks its own unique name; find it and rename
+						before = {str(i.name) for i in self.manis_file.mani_infos}
+						self.manis_file.duplicate((mani_name, ))
+						added = [str(i.name) for i in self.manis_file.mani_infos
+								 if str(i.name) not in before]
+						if len(added) != 1:
+							raise ValueError(f"expected 1 new clip, got {added}")
+						if added[0] != new_name:
+							self.manis_file.rename_file(added[0], new_name)
 					self.set_file_modified(True)
 				except:
 					self.handle_error("Duplicating file failed, see log!")

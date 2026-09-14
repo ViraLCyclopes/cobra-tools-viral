@@ -151,7 +151,7 @@ def save(reporter, filepath="", source_folder="", ms2_path="",
         except Exception as err:
             reporter.show_warning(f"{bundle_name}: {err} - channel growth disabled here")
             tracks = {}
-        edits, raw, pending, new_tracks = {}, {}, {}, {}
+        edits, raw, pending = {}, {}, {}
         bone_names = None      # armature order, identical for every action here
         for action in actions:
             clip = _clip_of(action)
@@ -186,46 +186,17 @@ def save(reporter, filepath="", source_folder="", ms2_path="",
                     add, unknown = [], []
                     reporter.show_warning(f"{clip}: could not check channels ({err})")
                 for group, bone in unknown:
-                    if group == 'scl':
-                        index = bone_names.index(bone)
-                        scale = values[:, index, 7:10]
-                        finite = scale[np.isfinite(scale)]
-                        if finite.size and np.allclose(finite, 1.0, atol=1e-5):
-                            # LocRotScale keying often adds identity scale keys.
-                            # Unit scale needs no channel; do not claim motion is lost.
-                            values[:, index, 7:10] = np.nan
-                            continue
-                        raise ValueError(f"{clip}: new scale track for '{bone}' is not supported; "
-                                         "export position/rotation with unit scale")
-                    if bone in tracks:
-                        raise ValueError(f"{clip}: '{bone}' has a track outside this clip's "
-                                         f"{group} range; cannot safely extend this layout")
-                    new_tracks.setdefault(clip, set()).add(bone)
+                    reporter.show_warning(
+                        f"{clip}: '{bone}' was animated but has no {group} track in this "
+                        f"bundle - it cannot be added and will not move")
                 if add:
                     pending.setdefault(clip, []).extend(add)
             raw[clip] = values
 
         # Grow every missing channel in one pass, then re-read the bundle so the
         # mapping below sees the new channel lists.
-        if pending or new_tracks:
+        if pending:
             grown = bytes(open(src, "rb").read())
-            if new_tracks:
-                from source.formats.manis.track_growth import add_bone_track
-                with tempfile.TemporaryDirectory(prefix='cobra_track_growth_') as work:
-                    current = os.path.join(work, 'input.manis')
-                    with open(current, 'wb') as stream:
-                        stream.write(grown)
-                    step = 0
-                    for clip, bones in new_tracks.items():
-                        for bone in sorted(bones):
-                            output = os.path.join(work, f'grown{step}.manis')
-                            add_bone_track(current, output, clip, bone, ms2_path)
-                            current = output
-                            step += 1
-                            total_channels += 2
-                            reporter.show_info(f"{clip}: created ori/pos track for '{bone}'")
-                    with open(current, 'rb') as stream:
-                        grown = stream.read()
             for clip, adds in pending.items():
                 for group, bone, track in adds:
                     reloaded = ManisFile()
@@ -267,7 +238,7 @@ def save(reporter, filepath="", source_folder="", ms2_path="",
                                       f"({err}) - skipped")
                 total_skipped += 1
                 continue
-            if action_source == "CHANGED" and clip not in new_tracks and values.shape == template.shape:
+            if action_source == "CHANGED" and values.shape == template.shape:
                 # Only clips actually touched. Our encoder is not Frontier's, so
                 # re-encoding an untouched clip is a real quality loss for nothing.
                 if _matches_template(template, values):
@@ -285,8 +256,8 @@ def save(reporter, filepath="", source_folder="", ms2_path="",
         reporter.show_info(f"nothing to export - {total_skipped} action(s) match their bundle")
         return
     reporter.show_info(
-        f"Spliced {total_clips} clip(s) into {out_dir}; {total_skipped} action(s) skipped. "
-        f"Shared ACL databases are re-encoded; untouched clips may not remain byte-identical"
+        f"Spliced {total_clips} clip(s) into {out_dir}; {total_skipped} unchanged and "
+        f"left byte-identical"
         + (f"; {total_bones} stripped bone(s) enabled" if total_bones else "")
         + (f"; {total_channels} NEW channel(s) added" if total_channels else ""))
 

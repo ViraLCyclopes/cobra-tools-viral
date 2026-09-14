@@ -467,7 +467,9 @@ class ChunkedMesh(MeshData):
 			tri_chunk.shell_index = self.shell_index
 			tri_chunk.shell_count = self.shell_count
 			# get the vertex count from the tri indices
-			vert_chunk.vertex_count = np.max(tri_chunk.tri_indices) + 1
+			# NumPy 2 preserves uint8 scalar arithmetic. Counts and cumulative
+			# offsets must be Python ints, or offsets wrap after 255 vertices.
+			vert_chunk.vertex_count = int(np.max(tri_chunk.tri_indices)) + 1
 			vert_chunk.weights_flag.mesh_format = self.mesh_format
 			if self.context.version > 53:
 				vert_chunk.weights_flag.material_effects = self.material_effects

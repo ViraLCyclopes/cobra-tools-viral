@@ -47,29 +47,7 @@ def get_next_backup_filename(filepath):
 		return os.path.join(sfolder, sname + '~' + str(new_suffix) + sext)
 
 
-def save(reporter, filepath='', backup_original=True, apply_transforms=False, update_rig=False, use_stock_normals_tangents=False, export_scope='FULL', leaf_source=''):
-	if export_scope == 'LEAF':
-		from plugin.leaf_bones import export_leaf
-		armature = bpy.context.object
-		if armature is None or armature.type != 'ARMATURE':
-			raise ValueError('Select the armature and active VFX leaf before exporting')
-		mode = armature.mode
-		try:
-			if mode != 'OBJECT':
-				bpy.ops.object.mode_set(mode='OBJECT')
-			bone = armature.data.bones.active
-			if bone is None:
-				raise ValueError('Select a VFX leaf before exporting')
-			source = leaf_source or armature.get('cobra_leaf_source', '')
-			if not source:
-				raise ValueError('Choose a source MS2 for the leaf export')
-			export_leaf(armature, bone, bpy.path.abspath(source), filepath)
-		finally:
-			if armature.mode != mode:
-				bpy.ops.object.mode_set(mode=mode)
-		return {'FINISHED'}
-	if export_scope != 'FULL':
-		raise ValueError(f'Unknown MS2 export scope: {export_scope}')
+def save(reporter, filepath='', backup_original=True, apply_transforms=False, update_rig=False, use_stock_normals_tangents=False):
 	start_time = time.time()
 
 	ms2 = Ms2File()

@@ -33,6 +33,10 @@ def png_to_dds(png_file_path, out_dir, codec="BC7_UNORM", num_mips=0, dds_use_gp
 		"-dx10", "-m", str(num_mips), "-sepalpha"]
 	if "SRGB" in codec:
 		args.append("-srgb")
+	else:
+		# a UNORM target stores the png's bytes verbatim; without this, a png tagged sRGB / gAMA 0.45455
+		# (Blender, GIMP, Paint.NET...) is read as *_UNORM_SRGB and linearised, i.e. packed much darker
+		args.append("--ignore-srgb")
 	if not dds_use_gpu:
 		args.append("-nogpu")
 	args.append(png_file_path)

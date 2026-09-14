@@ -50,6 +50,7 @@ from .edit import DEFAULT_GAME, load_motiongraph
 from .report import build_deref
 from .surgical_growth import (_load_quiet, append_tail_pool_bytes,
                               repoint_pool_end_fragments)
+from .staging import CandidatePublication, validate_staged_pair
 
 ENTRY_SIZE = 56
 CURVE_TYPE_OFFSET = 0
@@ -136,8 +137,13 @@ class DataStreamGrowthReport:
     string_reused: bool
 
 
-def find_activity(loader, deref, clip: str):
-    """The AnimationActivityData whose clip name contains `clip`."""
+def find_activity(loader, deref, clip: str | None = None,
+                  activity_address: tuple[int, int] | None = None):
+    """Resolve one activity by explicit payload address or clip name.
+
+    Text compatibility callers get exact full-name matching before substring
+    fallback.  Duplicate exact clips remain ambiguous unless an address is used.
+    """
     matches = []
     for (pool, offset), obj in list(loader.context.recursion.items()):
         if type(obj).__name__ != "AnimationActivityData":
@@ -146,10 +152,18 @@ def find_activity(loader, deref, clip: str):
             mani = str(deref(obj.mani))
         except Exception:
             continue
-        if clip in mani:
+        address = (int(pool.i), int(offset))
+        if activity_address is not None and address == tuple(map(int, activity_address)):
+            matches.append((*address, mani, obj))
+        elif activity_address is None and clip is not None and clip in mani:
             matches.append((int(pool.i), int(offset), mani, obj))
+    if activity_address is None and clip is not None:
+        exact = [match for match in matches if match[2] == clip]
+        if exact:
+            matches = exact
     if not matches:
-        raise ValueError(f"No animation activity whose clip name contains {clip!r}")
+        target = f"at {activity_address[0]}:{activity_address[1]}" if activity_address else f"whose clip name contains {clip!r}"
+        raise ValueError(f"No animation activity {target}")
     if len(matches) > 1:
         names = ", ".join(sorted(m[2] for m in matches))
         raise ValueError(f"{clip!r} is ambiguous, it matches: {names}")
@@ -171,11 +185,29 @@ def list_activities(source: Path, game: str = DEFAULT_GAME) -> list[str]:
     return sorted(names)
 
 
-def describe_activity(source: Path, clip: str, game: str = DEFAULT_GAME) -> dict:
+def list_activity_records(source: Path, game: str = DEFAULT_GAME) -> list[dict]:
+    """Structured activity identities; unlike the string API, duplicates survive."""
+    _ovl, loader = load_motiongraph(Path(source), None, game)
+    deref = build_deref(loader)
+    records = []
+    for (pool, offset), obj in list(loader.context.recursion.items()):
+        if type(obj).__name__ != "AnimationActivityData":
+            continue
+        try:
+            records.append({"activity": str(deref(obj.mani)),
+                            "activity_pool": int(pool.i),
+                            "activity_offset": int(offset)})
+        except Exception:
+            continue
+    return sorted(records, key=lambda row: (row["activity"], row["activity_pool"], row["activity_offset"]))
+
+
+def describe_activity(source: Path, clip: str | None, game: str = DEFAULT_GAME, *,
+                      activity_address: tuple[int, int] | None = None) -> dict:
     """Read-only: what an activity currently fires. Use before growing."""
     _ovl, loader = load_motiongraph(Path(source), None, game)
     deref = build_deref(loader)
-    pool, offset, mani, act = find_activity(loader, deref, clip)
+    pool, offset, mani, act = find_activity(loader, deref, clip, activity_address)
     lst = act.additional_data_streams
     ptr = lst.data_stream_resource_data
     streams = []
@@ -194,8 +226,8 @@ def describe_activity(source: Path, clip: str, game: str = DEFAULT_GAME) -> dict
         "activity_pool": pool,
         "activity_offset": offset,
         "count": int(lst.data_stream_resource_data_count),
-        "array_pool": int(ptr.target_pool.i),
-        "array_offset": int(ptr.target_offset),
+        "array_pool": int(ptr.target_pool.i) if ptr.target_pool is not None else None,
+        "array_offset": int(ptr.target_offset) if ptr.target_pool is not None else None,
         "streams": streams,
     }
 
@@ -238,6 +270,7 @@ def grow_data_stream(
     curve_points: "Sequence[tuple[float, float]] | None" = None,
     curve_type: int | None = None,
     game: str = DEFAULT_GAME,
+    activity_address: tuple[int, int] | None = None,
 ) -> DataStreamGrowthReport:
     """Append a datastream named `ds_name` of type `ds_type` to `clip`'s activity.
 
@@ -257,19 +290,13 @@ def grow_data_stream(
 
         curve_points=[(0.0, 0.0), (0.35, 1.0), (0.75, 0.0), (1.0, 0.0)]
     """
-    source, output = Path(source).resolve(), Path(output).resolve()
-    if source == output:
-        raise ValueError("Refusing to overwrite the source OVL; stage a full family")
-    if source.name.lower() != output.name.lower():
-        raise ValueError("Source and staged output basenames must match")
-    if not output.is_file():
-        raise ValueError("Copy the complete archive family to the stage directory first")
+    source, output = validate_staged_pair(source, output)
     if not ds_name or any(ord(c) < 32 or ord(c) > 126 for c in ds_name):
         raise ValueError(f"Datastream name must be printable ASCII: {ds_name!r}")
 
     _sem_ovl, loader = load_motiongraph(source, None, game)
     deref = build_deref(loader)
-    act_global, act_offset, mani, act = find_activity(loader, deref, clip)
+    act_global, act_offset, mani, act = find_activity(loader, deref, clip, activity_address)
     lst = act.additional_data_streams
     count = int(lst.data_stream_resource_data_count)
     ptr = lst.data_stream_resource_data
@@ -483,12 +510,14 @@ def grow_data_stream(
     struct.pack_into("<Q", result, head + UNCOMPRESSED_SIZE_OFFSET, expected_uncompressed)
     struct.pack_into("<I", result, head + POOLS_END_OFFSET, old_pools_end + pool_growth)
     struct.pack_into("<I", result, meta_offset, old_reservation + pool_growth)
-    output.write_bytes(result)
+    publication = CandidatePublication(source, output)
+    publication.path.write_bytes(result)
 
     # a written file is not a verified one: reload and read the list back
-    _check_ovl, check_loader = load_motiongraph(output, None, game)
+    _check_ovl, check_loader = load_motiongraph(publication.path, None, game)
     check_deref = build_deref(check_loader)
-    _p, _o, _m, grown = find_activity(check_loader, check_deref, clip)
+    _p, _o, _m, grown = find_activity(
+        check_loader, check_deref, clip, (act_global, act_offset))
     got = [str(check_deref(e.ds_name))
            for e in (check_deref(grown.additional_data_streams.data_stream_resource_data) or [])]
     wanted = existing + [ds_name]
@@ -498,6 +527,8 @@ def grow_data_stream(
             "Reloaded activity is wrong: count %d (wanted %d)\n  got    %r\n  wanted %r"
             % (reloaded, count + 1, got, wanted))
 
+    publication.commit()
+
     return DataStreamGrowthReport(
         output=output, activity=mani, ds_name=ds_name, ds_type=ds_type,
         old_count=count, new_count=count + 1, fragments_added=len(new_rows),
@@ -506,8 +537,9 @@ def grow_data_stream(
     )
 
 
-def read_data_stream_curve(source: Path, clip: str, ds_name: str,
-                           game: str = DEFAULT_GAME) -> list[tuple[float, float]]:
+def read_data_stream_curve(source: Path, clip: str | None, ds_name: str,
+                           game: str = DEFAULT_GAME, *,
+                           activity_address: tuple[int, int] | None = None) -> list[tuple[float, float]]:
     """Read one datastream's curve back as ``(x, y)`` pairs.
 
     This is the read half a curve editor needs: load, show, edit, write back
@@ -515,7 +547,7 @@ def read_data_stream_curve(source: Path, clip: str, ds_name: str,
     """
     _sem_ovl, loader = load_motiongraph(Path(source).resolve(), None, game)
     deref = build_deref(loader)
-    _p, _o, mani, act = find_activity(loader, deref, clip)
+    _p, _o, mani, act = find_activity(loader, deref, clip, activity_address)
     for entry in (deref(act.additional_data_streams.data_stream_resource_data) or []):
         if str(deref(entry.ds_name)) != ds_name:
             continue
@@ -528,7 +560,8 @@ def set_data_stream_curve(source: Path, output: Path, clip: str, ds_name: str,
                           points: "Sequence[tuple[float, float]]",
                           game: str = DEFAULT_GAME,
                           *, ds_type: str | None = None,
-                          curve_type: int | None = None) -> dict:
+                          curve_type: int | None = None,
+                          activity_address: tuple[int, int] | None = None) -> dict:
     """Replace the curve on an EXISTING datastream, in place.
 
     Growth adds an entry; this only changes when an entry is on. It allocates a
@@ -554,19 +587,13 @@ def set_data_stream_curve(source: Path, output: Path, clip: str, ds_name: str,
     `ds_type` must already exist as a string in the archive; retyping never
     allocates one.
     """
-    source, output = Path(source).resolve(), Path(output).resolve()
-    if source == output:
-        raise ValueError("Refusing to overwrite the source OVL; stage a full family")
-    if source.name.lower() != output.name.lower():
-        raise ValueError("Source and staged output basenames must match")
-    if not output.is_file():
-        raise ValueError("Copy the complete archive family to the stage directory first")
+    source, output = validate_staged_pair(source, output)
 
     curve_blob = _pack_curve_points(points)
 
     _sem_ovl, loader = load_motiongraph(source, None, game)
     deref = build_deref(loader)
-    act_global, act_offset, mani, act = find_activity(loader, deref, clip)
+    act_global, act_offset, mani, act = find_activity(loader, deref, clip, activity_address)
     ptr = act.additional_data_streams.data_stream_resource_data
     arr_global, arr_offset = int(ptr.target_pool.i), int(ptr.target_offset)
     names = [str(deref(e.ds_name)) for e in (deref(ptr) or [])]
@@ -581,6 +608,14 @@ def set_data_stream_curve(source: Path, output: Path, clip: str, ds_name: str,
     if arr_pool not in ovs.pools:
         raise ValueError("Entry array pool is not in STATIC")
     arr_local = ovs.pools.index(arr_pool)
+
+    array_inbound = int(((fragments["struct_pool"] == arr_local)
+                         & (fragments["struct_offset"] == arr_offset)).sum())
+    if array_inbound > 1:
+        raise ValueError(
+            f"Datastream entry array {arr_local}:{arr_offset} is shared by "
+            f"{array_inbound} owners; an activity-specific curve edit cannot be isolated safely"
+        )
 
     entry_base = arr_offset + index * ENTRY_SIZE
     curve_mask = ((fragments["link_pool"] == arr_local)
@@ -655,10 +690,13 @@ def set_data_stream_curve(source: Path, output: Path, clip: str, ds_name: str,
     struct.pack_into("<Q", result, head + UNCOMPRESSED_SIZE_OFFSET, expected_uncompressed)
     struct.pack_into("<I", result, head + POOLS_END_OFFSET, old_pools_end + pool_growth)
     struct.pack_into("<I", result, meta_offset, old_reservation + pool_growth)
-    output.write_bytes(result)
+    publication = CandidatePublication(source, output)
+    publication.path.write_bytes(result)
 
     # a written file is not a verified one: read the curve back off disk
-    got = read_data_stream_curve(output, clip, ds_name, game)
+    got = read_data_stream_curve(
+        publication.path, clip, ds_name, game,
+        activity_address=(act_global, act_offset))
     wanted = [(float(x), float(y)) for x, y in points]
     if len(got) != len(wanted) or any(
             abs(a[0] - b[0]) > 1e-4 or abs(a[1] - b[1]) > 1.0 / 64
@@ -666,10 +704,14 @@ def set_data_stream_curve(source: Path, output: Path, clip: str, ds_name: str,
         raise ValueError(f"Reloaded curve is wrong:\n  got    {got}\n  wanted {wanted}")
 
     reloaded_type = next(
-        (s["type"] for s in describe_activity(output, clip, game)["streams"]
+        (s["type"] for s in describe_activity(
+            publication.path, clip, game,
+            activity_address=(act_global, act_offset))["streams"]
          if s["ds_name"] == ds_name), None)
     if ds_type is not None and reloaded_type != ds_type:
         raise ValueError(f"Reloaded type is {reloaded_type!r}, wanted {ds_type!r}")
+
+    publication.commit()
 
     return {"output": output, "activity": mani, "ds_name": ds_name,
             "points": got, "type": reloaded_type,
@@ -687,14 +729,20 @@ def activities_with_stream(source: Path, ds_name: str,
     _ovl, loader = load_motiongraph(Path(source), None, game)
     deref = build_deref(loader)
     found = []
-    for _key, obj in list(loader.context.recursion.items()):
+    for (pool, offset), obj in list(loader.context.recursion.items()):
         if type(obj).__name__ != "AnimationActivityData":
             continue
         try:
             entries = list(deref(obj.additional_data_streams.data_stream_resource_data) or [])
         except Exception:
             continue
-        for entry in entries:
+        if not entries:
+            continue
+        ptr = obj.additional_data_streams.data_stream_resource_data
+        if ptr.target_pool is None or ptr.target_offset is None:
+            continue
+        arr_pool, arr_offset = int(ptr.target_pool.i), int(ptr.target_offset)
+        for index, entry in enumerate(entries):
             try:
                 if str(deref(entry.ds_name)) != ds_name:
                     continue
@@ -704,8 +752,11 @@ def activities_with_stream(source: Path, ds_name: str,
                 continue
             found.append({"activity": mani, "type": str(deref(entry.type)),
                           "curve_type": int(entry.curve_type),
-                          "animation_flags": flags, "held": is_held(flags)})
-    found.sort(key=lambda d: d["activity"])
+                          "animation_flags": flags, "held": is_held(flags),
+                          "activity_pool": int(pool.i), "activity_offset": int(offset),
+                          "stream_pool": arr_pool,
+                          "stream_offset": arr_offset + index * ENTRY_SIZE})
+    found.sort(key=lambda d: (d["activity"], d["activity_pool"], d["activity_offset"]))
     return found
 
 
@@ -715,40 +766,137 @@ def set_curve_everywhere(source: Path, output: Path, ds_name: str,
                          ds_type: str | None = None,
                          curve_type: int | None = None,
                          only: "Sequence[str] | None" = None) -> list[dict]:
-    """Apply one curve/type to EVERY activity that fires `ds_name`.
-
-    Each :func:`set_data_stream_curve` call rewrites the whole archive, so they
-    have to be chained source -> output; doing that by hand is six staging
-    directories and easy to get wrong. `only` restricts it to named activities.
-    """
-    import shutil
-    import tempfile
-
-    source, output = Path(source).resolve(), Path(output).resolve()
-    targets = [d["activity"] for d in activities_with_stream(source, ds_name, game)]
+    """Apply one curve/type in one load/allocation/serialization session."""
+    source, output = validate_staged_pair(source, output)
+    all_targets = activities_with_stream(source, ds_name, game)
+    targets = list(all_targets)
     if only is not None:
         wanted = set(only)
-        targets = [t for t in targets if t in wanted or t.split("$")[-1] in wanted]
+        targets = [t for t in targets if t["activity"] in wanted
+                   or t["activity"].split("$")[-1] in wanted]
     if not targets:
         raise ValueError(f"No activity fires {ds_name!r}")
 
+    # One entry array can be shared by several activity payloads. Editing its
+    # stream once is correct only when every owner is in the requested scope.
+    def stream_id(row):
+        return int(row["stream_pool"]), int(row["stream_offset"])
+    all_counts, selected_counts = {}, {}
+    for row in all_targets:
+        all_counts[stream_id(row)] = all_counts.get(stream_id(row), 0) + 1
+    for row in targets:
+        selected_counts[stream_id(row)] = selected_counts.get(stream_id(row), 0) + 1
+    partial = [identity for identity, count in selected_counts.items()
+               if count != all_counts[identity]]
+    if partial:
+        raise ValueError(
+            "Requested activity scope includes only part of a shared datastream "
+            f"entry; cannot isolate {partial} safely")
+
+    curve_blob = _pack_curve_points(points)
+    ovl, static = _load_quiet(source, game)
+    ovs, fragments = static.content, static.content.fragments
+    old_uncompressed = int(static.uncompressed_size)
+    old_compressed = int(static.compressed_size)
+    old_pools_end = int(static.pools_end)
+    old_pool_sizes = tuple(int(pool.size) for pool in ovs.pools)
+    old_fragment_count = int(static.num_fragments)
+    static_index = ovl.archives.index(static)
+    old_reservation = int(ovl.archives_meta[static_index].unk_0)
+    type_site = _find_string(ovl, ovs, ds_type) if ds_type is not None else None
+    if ds_type is not None and type_site is None:
+        raise ValueError(f"The datastream type string {ds_type!r} is not in this archive")
+
+    allocations = []
+    representatives = {}
+    for row in targets:
+        representatives.setdefault(stream_id(row), row)
+    for (array_global, entry_base), row in representatives.items():
+        array_pool = ovl.pools[array_global]
+        if array_pool not in ovs.pools:
+            raise ValueError(f"Datastream entry pool {array_global} is not in STATIC")
+        array_local = ovs.pools.index(array_pool)
+        curve_mask = ((fragments["link_pool"] == array_local)
+                      & (fragments["link_offset"] == entry_base + 48))
+        if int(curve_mask.sum()) != 1:
+            raise ValueError(
+                f"Expected one curve fragment at {array_local}:{entry_base + 48}")
+        allocation = append_tail_pool_bytes(
+            ovl.pools, ovs.pools, int(array_pool.type), curve_blob, alignment=16)
+        repoint_pool_end_fragments(
+            fragments, allocation.local_pool, allocation.old_size, allocation.new_size)
+        allocations.append(allocation)
+        fragments["struct_pool"][curve_mask] = allocation.local_pool
+        fragments["struct_offset"][curve_mask] = allocation.offset
+
+        array_pool.data.seek(entry_base + CURVE_COUNT_OFFSET)
+        array_pool.data.write(struct.pack("<Q", len(points)))
+        array_pool.data.seek(0)
+
+        if type_site is not None:
+            type_mask = ((fragments["link_pool"] == array_local)
+                         & (fragments["link_offset"] == entry_base + 16))
+            if int(type_mask.sum()) != 1:
+                raise ValueError(
+                    f"Expected one type fragment at {array_local}:{entry_base + 16}")
+            fragments["struct_pool"][type_mask] = type_site[0]
+            fragments["struct_offset"][type_mask] = type_site[1]
+        if curve_type is not None:
+            array_pool.data.seek(entry_base + CURVE_TYPE_OFFSET)
+            array_pool.data.write(struct.pack("<Q", int(curve_type)))
+            array_pool.data.seek(0)
+
+    ovs.write_pools()
+    uncompressed = ovs.write_archive()
+    pool_growth = sum(a.new_size - a.old_size for a in allocations)
+    expected_uncompressed = old_uncompressed + pool_growth
+    if len(uncompressed) != expected_uncompressed:
+        raise ValueError(
+            f"Unexpected STATIC growth: {len(uncompressed)} vs {expected_uncompressed}")
+    expected_sizes = list(old_pool_sizes)
+    for allocation in allocations:
+        expected_sizes[allocation.local_pool] = allocation.new_size
+    if tuple(int(pool.size) for pool in ovs.pools) != tuple(expected_sizes):
+        raise ValueError("An unrelated pool changed size while setting batch curves")
+    if int(static.num_fragments) != old_fragment_count:
+        raise ValueError("Fragment count changed during batch curve editing")
+
+    _, new_compressed, compressed = ovs.compress(uncompressed, True)
+    source_bytes = source.read_bytes()
+    header_size = len(source_bytes) - old_compressed
+    meta_offset = header_size - len(ovl.archives_meta) * 8 + static_index * 8
+    result = bytearray(source_bytes[:header_size])
+    result.extend(compressed)
+    head = int(static.io_start)
+    struct.pack_into("<I", result, head + NUM_FRAGMENTS_OFFSET, static.num_fragments)
+    struct.pack_into("<I", result, head + COMPRESSED_SIZE_OFFSET, new_compressed)
+    struct.pack_into("<Q", result, head + UNCOMPRESSED_SIZE_OFFSET, expected_uncompressed)
+    struct.pack_into("<I", result, head + POOLS_END_OFFSET, old_pools_end + pool_growth)
+    struct.pack_into("<I", result, meta_offset, old_reservation + pool_growth)
+
+    publication = CandidatePublication(source, output)
+    publication.path.write_bytes(result)
+    _check_ovl, loader = load_motiongraph(publication.path, None, game)
+    deref = build_deref(loader)
+    wanted_points = [(float(x), float(y)) for x, y in points]
     applied = []
-    with tempfile.TemporaryDirectory(prefix="ds_chain_") as tmp:
-        tmp = Path(tmp)
-        current = source
-        for index, clip in enumerate(targets):
-            last = index == len(targets) - 1
-            if last:
-                step_dir = output.parent
-            else:
-                step_dir = tmp / ("step%d" % index)
-                step_dir.mkdir(parents=True, exist_ok=True)
-                for f in source.parent.iterdir():
-                    if f.is_file():
-                        shutil.copy2(f, step_dir / f.name)
-            result = set_data_stream_curve(current, step_dir / source.name, clip,
-                                           ds_name, points, game,
-                                           ds_type=ds_type, curve_type=curve_type)
-            applied.append({"activity": result["activity"], "type": result["type"]})
-            current = step_dir / source.name
+    for target in targets:
+        _pool, _offset, mani, activity = find_activity(
+            loader, deref, target["activity"],
+            (target["activity_pool"], target["activity_offset"]))
+        entries = list(deref(activity.additional_data_streams.data_stream_resource_data) or [])
+        entry = next((item for item in entries if str(deref(item.ds_name)) == ds_name), None)
+        if entry is None:
+            raise ValueError(f"Reloaded {mani} no longer fires {ds_name!r}")
+        got = [(float(point.x), decode_curve_y(int(point.y)))
+               for point in (deref(entry.curve.points) or [])]
+        if len(got) != len(wanted_points) or any(
+                abs(a[0] - b[0]) > 1e-4 or abs(a[1] - b[1]) > 1.0 / 64
+                for a, b in zip(got, wanted_points)):
+            raise ValueError(f"Reloaded curve is wrong for {mani}: {got!r}")
+        got_type = str(deref(entry.type))
+        if ds_type is not None and got_type != ds_type:
+            raise ValueError(f"Reloaded type for {mani} is {got_type!r}, wanted {ds_type!r}")
+        applied.append({"activity": mani, "type": got_type})
+    publication.commit()
     return applied

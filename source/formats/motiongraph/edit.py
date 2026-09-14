@@ -22,6 +22,7 @@ from generated.formats.motiongraph.imports import name_type_map
 from generated.formats.motiongraph.structs.Activity import Activity
 from generated.formats.ovl import OvlFile
 from generated.formats.ovl_base.structs.MemStruct import MemStruct
+from .staging import CandidatePublication, validate_staged_pair
 
 
 if not hasattr(logging, "success"):
@@ -242,7 +243,13 @@ def locate_fields(ovl_path: Path, name: str | None = None,
         ({(int(pool), int(offset)) for pool, offset in activity_addresses}
          if activity_addresses is not None else None)
     )
+    ovl_path = Path(ovl_path).resolve()
+    source_hash = hashlib.sha256(ovl_path.read_bytes()).hexdigest()
     _, loader = load_motiongraph(ovl_path, name, game)
+    if hashlib.sha256(ovl_path.read_bytes()).hexdigest() != source_hash:
+        raise ValueError("Source OVL changed while fields were being scanned; reload it")
+    provenance = {"source": str(ovl_path), "source_sha256": source_hash,
+                  "motiongraph": loader.name}
     context = loader.context
     field_types: dict[str, type] = {}
     stride_mismatches: dict[str, tuple[int, int]] = {}
@@ -310,6 +317,7 @@ def locate_fields(ovl_path: Path, name: str | None = None,
                 "activity": label, "activity_type": item_type,
                 "pool": int(pool.i), "payload_offset": int(offset),
                 "alloc_size": pool.size_map.get(offset), "fields": matches,
+                "provenance": dict(provenance),
             })
     return rows, stride_mismatches
 
@@ -319,6 +327,24 @@ def build_patch_plan(rows: list[dict], source: Path, motiongraph: str | None,
                      flag_ops: list[str] | None = None,
                      enum_name: str | None = None) -> dict:
     """Build a self-verifying, same-width patch plan from located rows."""
+    source = Path(source).resolve()
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    provenance = [row.get("provenance") for row in rows]
+    if not provenance or any(not item for item in provenance):
+        raise ValueError("Field rows have unknown source provenance; scan the loaded source again")
+    for item in provenance:
+        if Path(item.get("source", "")).resolve() != source:
+            raise ValueError("Field rows belong to a different source OVL; scan again")
+        if str(item.get("source_sha256", "")).lower() != source_hash.lower():
+            raise ValueError("Field rows are stale because the source OVL bytes changed; scan again")
+    resolved_names = {str(item.get("motiongraph") or "") for item in provenance}
+    if len(resolved_names) != 1 or not next(iter(resolved_names)):
+        raise ValueError("Field rows contain mixed or missing motiongraph provenance; scan again")
+    resolved_name = next(iter(resolved_names))
+    if motiongraph is None:
+        motiongraph = resolved_name
+    elif resolved_name.lower() != str(motiongraph).lower():
+            raise ValueError("Field rows belong to a different motiongraph; scan again")
     fields = [(row, item) for row in rows for item in row["fields"]]
     if not fields:
         raise ValueError("No matching fields")
@@ -390,7 +416,7 @@ def build_patch_plan(rows: list[dict], source: Path, motiongraph: str | None,
         raise ValueError("All matching fields already have the requested value")
     return {
         "format": "cobra-motiongraph-patch-v1", "source": str(source),
-        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "source_sha256": source_hash,
         "motiongraph": motiongraph, "field": field, "kind": kind,
         "value": value, "flags": flag_ops, "enum": enum_name, "edits": edits,
     }
@@ -504,13 +530,7 @@ def load_plan(path: Path) -> dict:
 def apply_patch_plan(source: Path, output: Path, plan: dict,
                      game: str = DEFAULT_GAME) -> PatchReport:
     """Apply a plan by recompressing STATIC only, preserving its topology."""
-    source, output = source.resolve(), output.resolve()
-    if source == output:
-        raise ValueError("Refusing to overwrite the source OVL; write to a staged copy")
-    if source.name.lower() != output.name.lower():
-        raise ValueError(
-            "Source and output OVL basenames must match so the staged OVS/AUX family can reload"
-        )
+    source, output = validate_staged_pair(source, output)
     if plan.get("format") not in (None, "cobra-motiongraph-patch-v1"):
         raise ValueError(f"Unsupported patch-plan format: {plan.get('format')!r}")
     expected_hash = plan.get("source_sha256")
@@ -596,8 +616,8 @@ def apply_patch_plan(source: Path, output: Path, plan: dict,
     result = bytearray(source_bytes[:header_size])
     result.extend(compressed)
     struct.pack_into("<I", result, static.io_start + COMPRESSED_SIZE_OFFSET, compressed_size)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_bytes(result)
+    publication = CandidatePublication(source, output)
+    publication.path.write_bytes(result)
 
     # A valid main OVL is not sufficient: require the complete staged family to
     # reload and re-check all target bytes after decompression.
@@ -605,7 +625,7 @@ def apply_patch_plan(source: Path, output: Path, plan: dict,
     previous_disable = logging.root.manager.disable
     try:
         logging.disable(logging.CRITICAL)
-        check.load(str(output), {"game": game})
+        check.load(str(publication.path), {"game": game})
     finally:
         logging.disable(previous_disable)
     check_static = next((archive for archive in check.archives if archive.name == "STATIC"), None)
@@ -632,6 +652,7 @@ def apply_patch_plan(source: Path, output: Path, plan: dict,
                 f"Staged reload lost edit at pool {pool_index}:{offset}; "
                 f"expected {replacement.hex()}, found {actual.hex()}"
             )
+    publication.commit()
     return PatchReport(
         output=output, edits=len(edits), pools=len(by_pool),
         changed_bytes=sum(len(items) for items in intended.values()),

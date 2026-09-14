@@ -32,6 +32,7 @@ from pathlib import Path
 from .clone import COMPRESSED_SIZE_OFFSET, UNCOMPRESSED_SIZE_OFFSET
 from .edit import DEFAULT_GAME
 from .surgical_growth import _load_quiet
+from .staging import CandidatePublication, validate_staged_pair
 
 STRING_POOL_TYPE = 2
 
@@ -104,13 +105,7 @@ def repoint_stale_species_strings(source: Path, output: Path,
 								  old_token: str, new_token: str,
 								  game: str = DEFAULT_GAME) -> RenameRepairReport:
 	"""Aim every stale `old_token$` reference at its `new_token$` counterpart."""
-	source, output = Path(source).resolve(), Path(output).resolve()
-	if source == output:
-		raise ValueError("Refusing to overwrite the source OVL")
-	if source.name.lower() != output.name.lower():
-		raise ValueError("Source and staged output OVL basenames must match")
-	if not output.is_file():
-		raise ValueError("Copy the complete archive family to the stage directory first")
+	source, output = validate_staged_pair(source, output)
 
 	ovl, static = _load_quiet(source, game)
 	ovs = static.content
@@ -160,9 +155,10 @@ def repoint_stale_species_strings(source: Path, output: Path,
 	head = int(static.io_start)
 	struct.pack_into("<I", result, head + COMPRESSED_SIZE_OFFSET, new_compressed)
 	struct.pack_into("<Q", result, head + UNCOMPRESSED_SIZE_OFFSET, len(uncompressed))
-	output.write_bytes(result)
+	publication = CandidatePublication(source, output)
+	publication.path.write_bytes(result)
 
-	check_ovl, check_static = _load_quiet(output, game)
+	check_ovl, check_static = _load_quiet(publication.path, game)
 	_, check_sites = _index_strings(check_ovl, check_static.content)
 	left = 0
 	for row in check_static.content.fragments:
@@ -171,6 +167,7 @@ def repoint_stale_species_strings(source: Path, output: Path,
 			left += 1
 	if left:
 		raise ValueError(f"{left} repairable {prefix} references survived the rewrite")
+	publication.commit()
 
 	return RenameRepairReport(
 		output=output, old_token=prefix, new_token=replacement,

@@ -43,12 +43,6 @@ class ExportMS2(ExportOp):
     filename_ext = ".ms2"
     target = export_ms2.save
     filter_glob: StringProperty(default="*.ms2", options={'HIDDEN'})
-    export_scope: EnumProperty(
-        name="Export", default='FULL',
-        items=(('FULL', 'Meshes and Rig', 'Export geometry and weights; enable Update Rigs for bone edits'),
-               ('LEAF', 'Active VFX Leaf Only', 'Export rest placement, rotation or parenting while preserving source mesh bytes')))
-    leaf_source: StringProperty(name="Source MS2", subtype='FILE_PATH',
-                                description="Matching source rig; leaf output must be a separate file")
     apply_transforms: BoolProperty(name="Apply Transforms",
                                    description="Automatically applies object transforms to meshes", default=False)
     update_rig: BoolProperty(name="Update Rigs", description="Updates rigs (bones, physics joints, hitchecks) from blender - may break skeletons",
@@ -59,25 +53,10 @@ class ExportMS2(ExportOp):
         default=False)
 
     def invoke(self, context, _event):
-        if not self.leaf_source and context.object and context.object.type == 'ARMATURE':
-            self.leaf_source = context.object.get('cobra_leaf_source', '')
         if not self.filepath:
             self.filepath = context.scene.name + self.filename_ext
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
-
-    def draw(self, context):
-        layout = self.layout
-        layout.prop(self, 'export_scope')
-        if self.export_scope == 'LEAF':
-            layout.prop(self, 'leaf_source')
-            layout.label(text='Active leaf rest edits; source meshes preserved')
-            layout.label(text='Save to a separate MS2')
-        else:
-            layout.prop(self, 'update_rig')
-            layout.label(text='Enable Update Rigs for new or edited bones')
-            layout.prop(self, 'apply_transforms')
-            layout.prop(self, 'use_stock_normals_tangents')
 
 
 class ExportSPL(ExportOp):
@@ -248,10 +227,12 @@ class ExportManisSplice(ExportOp):
                     "poses them. Without this such a bone exports cleanly and "
                     "silently does not move in game")
     grow_channels: BoolProperty(
-        name="Add Missing Channels and Tracks", default=True,
-        description="Add missing channels and create new ori/pos tracks for custom "
-                    "bones using the supplied MS2 bind pose. New tracks rebuild the "
-                    "bundle database. New scale tracks are not supported")
+        name="Add Missing Channels", default=True,
+        description="Give the clip a channel for any bone you animated that it has "
+                    "no channel for at all. Without this such a bone is dropped "
+                    "SILENTLY - the export succeeds and it never moves in game. "
+                    "Costs no extra bytes and moves nothing; the bone must already "
+                    "have a track somewhere in this bundle")
 
     def draw(self, context):
         layout = self.layout

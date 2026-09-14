@@ -22,6 +22,7 @@ from generated.formats.ovl_base.structs.Pointer import Pointer
 
 from .capacity import _iter_pointers, audit_allocations
 from .edit import COMPRESSED_SIZE_OFFSET, DEFAULT_GAME, load_motiongraph
+from .staging import CandidatePublication, validate_staged_pair
 
 
 NUM_FRAGMENTS_OFFSET = 28
@@ -247,13 +248,7 @@ def grow_null_prefix(source: Path, output: Path, array_pool: int, array_offset: 
     aligns non-string pointer targets to 16 bytes. The known land candidates use
     8-byte ActivityReference elements and would move to an 8-mod-16 address.
     """
-    source, output = source.resolve(), output.resolve()
-    if source == output:
-        raise ValueError("Refusing to overwrite the source OVL")
-    if source.name.lower() != output.name.lower():
-        raise ValueError("Source and staged output OVL basenames must match")
-    if not output.is_file():
-        raise ValueError("Copy the complete archive family to the stage directory first")
+    source, output = validate_staged_pair(source, output)
 
     ovl, loader = load_motiongraph(source, name, game)
     static = next((archive for archive in ovl.archives if archive.name == "STATIC"), None)
@@ -356,9 +351,10 @@ def grow_null_prefix(source: Path, output: Path, array_pool: int, array_offset: 
     result = bytearray(source_bytes[:header_size])
     result.extend(compressed)
     struct.pack_into("<I", result, static.io_start + COMPRESSED_SIZE_OFFSET, compressed_size)
-    output.write_bytes(result)
+    publication = CandidatePublication(source, output)
+    publication.path.write_bytes(result)
 
-    check, check_static = _load_quiet(output, game)
+    check, check_static = _load_quiet(publication.path, game)
     check_topology = (
         int(check_static.num_pools), int(check_static.num_fragments),
         int(check_static.uncompressed_size),
@@ -379,6 +375,7 @@ def grow_null_prefix(source: Path, output: Path, array_pool: int, array_offset: 
         check.pools[int(count_pool.i)].data.getvalue()[count_offset:count_offset + count_width],
         "little",
     )
+
     if reloaded_count != new_count:
         raise ValueError(f"Reloaded count is {reloaded_count}, expected {new_count}")
     check_loader = next(
@@ -407,6 +404,7 @@ def grow_null_prefix(source: Path, output: Path, array_pool: int, array_offset: 
     first_pointers = list(MemStruct.get_instances_recursive(decoded[0], Pointer))
     if any(item.target_pool is not None for item, _field, _args in first_pointers):
         raise ValueError("Prepended array element is not null after reload")
+    publication.commit()
     return NullPrefixGrowthReport(
         output=output, pool=array_pool, old_offset=array_offset, new_offset=new_offset,
         old_count=old_count, new_count=new_count, element_size=element_size,
@@ -436,13 +434,7 @@ def move_fragment_source(source: Path, output: Path,
     the now-null source slot is outside its logical extent. All four arguments
     must be supplied together and currently describe a little-endian uint32.
     """
-    source, output = source.resolve(), output.resolve()
-    if source == output:
-        raise ValueError("Refusing to overwrite the source OVL")
-    if source.name.lower() != output.name.lower():
-        raise ValueError("Source and staged output OVL basenames must match")
-    if not output.is_file():
-        raise ValueError("Copy the complete archive family to the stage directory first")
+    source, output = validate_staged_pair(source, output)
     ovl, static = _load_quiet(source, game)
 
     def local_pool(global_index: int):
@@ -509,9 +501,10 @@ def move_fragment_source(source: Path, output: Path,
     result = bytearray(source_bytes[:len(source_bytes) - compressed_before])
     result.extend(compressed)
     struct.pack_into("<I", result, static.io_start + COMPRESSED_SIZE_OFFSET, compressed_size)
-    output.write_bytes(result)
+    publication = CandidatePublication(source, output)
+    publication.path.write_bytes(result)
 
-    check, check_static = _load_quiet(output, game)
+    check, check_static = _load_quiet(publication.path, game)
     check_topology = (
         int(check_static.num_pools), int(check_static.num_fragments),
         int(check_static.uncompressed_size),
@@ -532,6 +525,7 @@ def move_fragment_source(source: Path, output: Path,
         & (check_fragments["struct_pool"] == target_local)
         & (check_fragments["struct_offset"] == target_offset)
     ).sum())
+
     if donor_left or destination_after != 1:
         raise ValueError(
             f"Reloaded fragment move failed: donor={donor_left}, destination={destination_after}"
@@ -544,6 +538,7 @@ def move_fragment_source(source: Path, output: Path,
             raise ValueError(
                 f"Reloaded donor count is {reloaded_count}, expected {new_count}"
             )
+    publication.commit()
     return FragmentSourceMoveReport(
         output=output, source=(from_pool, from_offset), destination=(to_pool, to_offset),
         target=(target_pool, target_offset), moved_fragments=moved,
@@ -565,13 +560,7 @@ def add_fragment_source(source: Path, output: Path,
     The source and target use global pool indices at the API boundary. The STATIC
     fragment table and uncompressed archive grow by exactly one 16-byte record.
     """
-    source, output = source.resolve(), output.resolve()
-    if source == output:
-        raise ValueError("Refusing to overwrite the source OVL")
-    if source.name.lower() != output.name.lower():
-        raise ValueError("Source and staged output OVL basenames must match")
-    if not output.is_file():
-        raise ValueError("Copy the complete archive family to the stage directory first")
+    source, output = validate_staged_pair(source, output)
     ovl, static = _load_quiet(source, game)
 
     def local_pool(global_index: int) -> int:
@@ -639,9 +628,10 @@ def add_fragment_source(source: Path, output: Path,
     struct.pack_into(
         "<Q", result, archive_header + UNCOMPRESSED_SIZE_OFFSET, uncompressed_after
     )
-    output.write_bytes(result)
+    publication = CandidatePublication(source, output)
+    publication.path.write_bytes(result)
 
-    check, check_static = _load_quiet(output, game)
+    check, check_static = _load_quiet(publication.path, game)
     if int(check_static.num_fragments) != fragments_before + 1:
         raise ValueError("Reloaded fragment count did not grow by one")
     if int(check_static.uncompressed_size) != uncompressed_after:
@@ -657,6 +647,7 @@ def add_fragment_source(source: Path, output: Path,
     ).sum())
     if exact != 1:
         raise ValueError(f"Reloaded archive has {exact} copies of the new fragment")
+    publication.commit()
     return FragmentGrowthReport(
         output=output, source=(link_pool, link_offset),
         target=(target_pool, target_offset), pools=len(before_pools),

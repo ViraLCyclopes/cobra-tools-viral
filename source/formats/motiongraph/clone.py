@@ -24,6 +24,7 @@ from .surgical_growth import (
     append_tail_pool_bytes,
     repoint_pool_end_fragments,
 )
+from .staging import CandidatePublication, validate_staged_pair
 
 
 NUM_FRAGMENTS_OFFSET = 28
@@ -148,13 +149,7 @@ def clone_complete_animation_activity(
     global pool/offset pointer-source addresses; omit it to preserve the original
     all-inbound behavior.
     """
-    source, output = source.resolve(), output.resolve()
-    if source == output:
-        raise ValueError("Refusing to overwrite the source OVL")
-    if source.name.lower() != output.name.lower():
-        raise ValueError("Source and staged output OVL basenames must match")
-    if not output.is_file():
-        raise ValueError("Copy the complete archive family to the stage directory first")
+    source, output = validate_staged_pair(source, output)
     if speed is not None and (not np.isfinite(speed) or speed < 0.0):
         raise ValueError("Playback speed must be a finite non-negative number")
 
@@ -301,9 +296,10 @@ def clone_complete_animation_activity(
     struct.pack_into("<Q", result, archive_header + UNCOMPRESSED_SIZE_OFFSET, expected_uncompressed)
     struct.pack_into("<I", result, archive_header + POOLS_END_OFFSET, old_pools_end + pool_growth)
     struct.pack_into("<I", result, meta_offset, old_reservation + pool_growth)
-    output.write_bytes(result)
+    publication = CandidatePublication(source, output)
+    publication.path.write_bytes(result)
 
-    check_ovl, check_static = _load_quiet(output, game)
+    check_ovl, check_static = _load_quiet(publication.path, game)
     if int(check_static.num_fragments) != old_fragments + len(new_fragments):
         raise ValueError("Reloaded fragment count is wrong")
     if int(check_static.uncompressed_size) != expected_uncompressed:
@@ -325,6 +321,7 @@ def clone_complete_animation_activity(
             f"expected donor={expected_donor_inbound}, clone={clone_inbound_after}, "
             f"expected clone={inbound_count}"
         )
+
     for allocation, moved, new_allocation_targets in (
         (wrapper_allocation, wrapper_sentinels, inbound_count),
         (data_allocation, data_sentinels, 1),
@@ -345,7 +342,8 @@ def clone_complete_animation_activity(
 
     _decoded_ovl, decoded_loader, clone_activity, clone_payload, decoded_data_pool, decoded_data_offset = (
         _activity_at(
-            output, name, wrapper_allocation.global_pool, wrapper_allocation.offset, game
+            publication.path, name, wrapper_allocation.global_pool,
+            wrapper_allocation.offset, game
         )
     )
     if (decoded_data_pool, decoded_data_offset) != (
@@ -394,6 +392,8 @@ def clone_complete_animation_activity(
             raise ValueError(
                 f"{type_name} count moved by {moved}, expected a delta of {delta}"
             )
+
+    publication.commit()
 
     return CompleteActivityCloneReport(
         output=output,

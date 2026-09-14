@@ -64,7 +64,6 @@ if bpy_available:
 		logging.info(f"Running blender {fmt_version(bpy.app.version)}")
 
 		from .plugin import addon_updater_ops
-		from .plugin.leaf_bones import LEAF_CLASSES
 		from .plugin.modules_import.operators import *
 		from .plugin.modules_export.operators import *
 		from .plugin.utils.operators import *
@@ -248,7 +247,6 @@ if bpy_available:
 
 
 		classes = (
-			*LEAF_CLASSES,
 			*addon_updater_ops.classes,
 			AddHair,
 			ApplyPoseAll,

@@ -22,6 +22,7 @@ from .clone import (
 from .edit import DEFAULT_GAME, load_motiongraph
 from .report import build_deref
 from .surgical_growth import _load_quiet, append_tail_pool_bytes, repoint_pool_end_fragments
+from .staging import CandidatePublication, validate_staged_pair
 
 
 SELECTOR_DATA_SIZE = 56
@@ -66,11 +67,7 @@ def clone_fixed_random_selector(
     string, state, or MANI is added; the donor selector's fixed four-slot shape
     is preserved exactly.
     """
-    source, output = source.resolve(), output.resolve()
-    if source == output:
-        raise ValueError("Refusing to overwrite the source OVL")
-    if source.name.lower() != output.name.lower() or not output.is_file():
-        raise ValueError("Output must be a staged same-basename OVL family")
+    source, output = validate_staged_pair(source, output)
     if len(children) != SELECTOR_COUNT:
         raise ValueError(f"Exactly {SELECTOR_COUNT} selector children are required")
     if not route_targets:
@@ -237,9 +234,10 @@ def clone_fixed_random_selector(
     struct.pack_into("<Q", result, int(static.io_start) + UNCOMPRESSED_SIZE_OFFSET, expected_uncompressed)
     struct.pack_into("<I", result, int(static.io_start) + POOLS_END_OFFSET, old_pools_end + pool_growth)
     struct.pack_into("<I", result, meta_offset, old_reservation + pool_growth)
-    output.write_bytes(result)
+    publication = CandidatePublication(source, output)
+    publication.path.write_bytes(result)
 
-    check_ovl, check_loader = load_motiongraph(output, name or None, game)
+    check_ovl, check_loader = load_motiongraph(publication.path, name or None, game)
     check_deref = build_deref(check_loader)
     clone = _activity(
         check_loader, check_ovl, wrapper_allocation.global_pool, wrapper_allocation.offset
@@ -252,6 +250,8 @@ def clone_fixed_random_selector(
     )
     if clone.data_type.data != "RandomSelectActivityActivity" or actual != children:
         raise ValueError(f"Reloaded selector children are wrong: {actual!r}")
+
+    publication.commit()
 
     return RandomSelectorCloneReport(
         output=output,

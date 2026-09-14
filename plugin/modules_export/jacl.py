@@ -46,6 +46,121 @@ QVVF_TRACK_TYPE = 12
 JACL_VERSION = 1
 
 
+def clip_track_bones(mani_info):
+	"""Track index -> bone name for one clip; None where the clip names no bone.
+
+	The docstring above says "track index == the armature's bone order, no
+	remapping", and that holds only while the armature IS the clip's skeleton. It
+	breaks as soon as the ms2 import adds bones the clip does not carry: rig-edit
+	`NODE_` bones are inserted BETWEEN a bone and its parent, so they shift every
+	bone after them, and the LOD nodes add more at the end. UltimasaurusCE imports
+	as 184 bones against a 172-bone ms2, while its clips carry 178 and 180 tracks.
+	Sampling in armature order then writes each bone's animation onto whatever
+	track happens to sit at that index - which passes every offline check and
+	wrecks the animal in game.
+
+	The importer reads a clip as
+
+	    k.ori_bones[:] = transforms[:, k.ori_channel_to_bone, 0:4]
+
+	so channel `c` of a group belongs to bone `<group>_bones_names[c]` and lives
+	at track `<group>_channel_to_bone[c]`. Inverting that gives the clip's own
+	track order. Verified conflict-free on this bundle: ori/pos/scl always agree
+	on which track a bone occupies.
+	"""
+	count = int(mani_info.target_bone_count)
+	keys = mani_info.keys
+	slots = [None] * count
+	for group in ("ori", "pos", "scl"):
+		names = getattr(keys, f"{group}_bones_names", None)
+		channel_to_bone = getattr(keys, f"{group}_channel_to_bone", None)
+		if names is None or channel_to_bone is None:
+			continue
+		for channel, bone in enumerate(names):
+			if channel >= len(channel_to_bone):
+				break
+			track = int(channel_to_bone[channel])
+			if not 0 <= track < count:
+				logging.warning(f"{mani_info.name}: {group} channel {channel} maps to "
+								f"track {track}, outside 0..{count - 1} - ignored")
+				continue
+			bone = str(bone)
+			if slots[track] is not None and slots[track] != bone:
+				raise ValueError(
+					f"{mani_info.name}: track {track} is claimed by both "
+					f"{slots[track]!r} and {bone!r}; the channel maps disagree")
+			slots[track] = bone
+	return slots
+
+
+GROUP_SPANS = {"ori": slice(0, 4), "pos": slice(4, 7), "scl": slice(7, 10)}
+
+
+def bundle_track_index(manis):
+	"""bone name -> track index, unioned over every clip in the bundle.
+
+	A clip that does not name a bone still HAS its track - `target_bone_count` is
+	178 against a 172-bone ms2 - so the track number has to come from somewhere
+	else. Any clip in the bundle that does name the bone gives it, and the widest
+	clip usually names the whole skeleton. Raises if two clips disagree, which
+	would mean track index is not a bundle-wide bone id after all.
+	"""
+	out = {}
+	for mani_info in manis.mani_infos:
+		for track, name in enumerate(clip_track_bones(mani_info)):
+			if not name:
+				continue
+			if out.setdefault(name, track) != track:
+				raise ValueError(
+					f"{name!r} is track {out[name]} in one clip and {track} in "
+					f"{mani_info.name}; track index is not a bundle-wide bone id")
+	return out
+
+
+def missing_channels(values, bone_names, mani_info, tracks):
+	"""(group, bone, track) for bones the animator authored that this clip cannot pose.
+
+	`sample_action` already NaN-fills every channel group it considers unauthored,
+	so "has non-NaN data" is exactly "the animator touched this". A bone in that
+	state whose group has no channel in this clip would otherwise be dropped
+	SILENTLY - the export succeeds and the bone simply never moves in game.
+	"""
+	out, unknown = [], []
+	for group, span in GROUP_SPANS.items():
+		named = {str(x) for x in (getattr(mani_info.keys, f"{group}_bones_names", None) or [])}
+		lo = int(getattr(mani_info, f"{group}_bone_min"))
+		hi = int(getattr(mani_info, f"{group}_bone_max"))
+		for index, bone in enumerate(bone_names):
+			if bone in named or np.isnan(values[:, index, span]).all():
+				continue
+			track = tracks.get(bone)
+			if track is None or not lo <= track <= hi:
+				unknown.append((group, bone))
+				continue
+			out.append((group, bone, track))
+	return out, unknown
+
+
+def to_clip_tracks(values, bone_names, mani_info):
+	"""Reorder armature-ordered samples into one clip's own track order.
+
+	`values` is (samples, armature bones, 10) from `sample_action`. The result is
+	(samples, target_bone_count, 10). Tracks the clip names no bone for stay NaN,
+	which is the same "stripped, equals the bind pose" sentinel the importer reads.
+	"""
+	order = clip_track_bones(mani_info)
+	index = {name: i for i, name in enumerate(bone_names)}
+	columns = np.array([index.get(name, -1) if name else -1 for name in order])
+	missing = [name for name in order if name and name not in index]
+	if missing:
+		logging.warning(f"{mani_info.name}: {len(missing)} track bone(s) are not in the "
+						f"armature and stay at the bind pose, e.g. {missing[:4]}")
+	out = np.full((values.shape[0], len(order), values.shape[2]), np.nan, dtype=values.dtype)
+	present = columns >= 0
+	out[:, present, :] = values[:, columns[present], :]
+	return out
+
+
 def sample_action(b_armature_ob, b_action, sample_rate=30.0003):
 	"""Return (values, bone_names) for `b_action` on `b_armature_ob`.
 
