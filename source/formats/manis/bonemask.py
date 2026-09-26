@@ -22,6 +22,48 @@ import struct
 
 COUNT_AFTER_MASK = 0x40      # count+flag pair, relative to the mask start
 SEARCH_BACK = 0x4000
+RECORD_SIZE = 0x48           # mask .. 0x40 count .. 0x44 flag .. end
+
+
+def build_record(num_tracks, bones):
+    """Construct a per-clip bone-mask record from scratch.
+
+    This is what makes writing a JWE3 ACL bundle from scratch possible: the
+    module could previously only FIND and EDIT a record, so every from-scratch
+    path had to adopt and patch a vanilla one.
+
+    Layout, measured (see below):
+
+        0x00  mask, ceil(num_tracks/64) qwords, bit n = bone n
+              zero-filled from the end of the mask up to 0x40
+        0x40  uint32 num_tracks
+        0x44  uint32 1
+        total 0x48, fixed whatever the mask width - the mask cannot exceed
+        0x40 bytes because that would need more than 512 bones
+
+    **Vanilla-verified: 208/208 Acrocanthosaurus records (num_tracks 170 and
+    172, both 0x48 and 0x50 blob gaps) rebuild BYTE-IDENTICALLY from nothing but
+    `(num_tracks, posed bones)`.** Records were located by popcount-verified
+    match, so none of those 208 is a false positive. The 0x48 vs 0x50 distance
+    to the ACL blob is alignment padding after the record, not part of it.
+
+    `bones` is the set the clip may pose - normally the bones whose rotation the
+    ACL blob stores, i.e. `num_animated_rotation + num_constant_rotation`. A
+    sub-track stored without its bit set here is inert in game.
+    """
+    nw = mask_words(num_tracks)
+    if nw * 8 > COUNT_AFTER_MASK:
+        raise ValueError(f"{num_tracks} bones needs {nw} mask qwords, which would "
+                         f"overrun the count+flag pair at 0x{COUNT_AFTER_MASK:x}")
+    words = [0] * nw
+    for b in bones:
+        if not 0 <= b < num_tracks:
+            raise ValueError(f"bone {b} outside this clip's {num_tracks} tracks")
+        words[b >> 6] |= 1 << (b & 63)
+    record = bytearray(RECORD_SIZE)
+    struct.pack_into(f"<{nw}Q", record, 0, *words)
+    struct.pack_into("<II", record, COUNT_AFTER_MASK, num_tracks, 1)
+    return bytes(record)
 
 
 def mask_words(num_tracks):

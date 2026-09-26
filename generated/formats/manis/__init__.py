@@ -500,6 +500,26 @@ class ManisFile(InfoHeader, IoFile):
             self.update_key_indices(mani_info, POS)
             self.update_key_indices(mani_info, ORI)
             self.update_key_indices(mani_info, SCL)
+            # `extra_count` is JWE3/PC2-only and nothing ever set it, so every
+            # bundle cobra CREATES carried 0 while declaring float channels.
+            # Vanilla is always equal - 215/215 Acrocanthosaurus clips, dtype 0
+            # and compressed alike.
+            #
+            # It matters because the two readers disagree: cobra sizes the
+            # scalar-channel section from `float_count`, so a wrong
+            # `extra_count` is invisible here AND in Blender, while the GAME
+            # reads `extra_count` and walks the channel-name array short by
+            # 4 bytes per missing channel. Every table after it -
+            # channel_to_bone, bone_to_channel, PosBones, OriBones - then
+            # shifts, bones receive other bones' transforms, and the mesh
+            # renders torn into spikes. Game-verified on a JWE3 scenery deco
+            # 2026-09-26: 10 floats declared as 0 mangled the model, and
+            # setting this fixed it. This also fixes plugin/export_manis.py,
+            # which sets float_count and never set this.
+            #
+            # No-op on every shipped file - the field is not serialised outside
+            # JWE3/PC2 - so vanilla round trips are unaffected.
+            mani_info.extra_count = int(mani_info.float_count)
         super().save(filepath)
 
     def get_mani(self, name):
