@@ -219,8 +219,18 @@ class DummyReporter:
 	@contextlib.contextmanager
 	def report_error_files(self, operation):
 		error_files = []
+		# Reset per operation: a stale failure from an earlier operation must not
+		# block a later legitimate save in a long-lived session such as the GUI.
+		self.failed_files = []
 		yield error_files
 		if error_files:
+			# Record failures on the reporter so a caller can refuse to save.
+			# warning_msg is a DummySignal outside the GUI, so emitting alone
+			# loses this entirely - a file that failed to convert would then be
+			# written out as garbage under a SUCCESS message.
+			self.failed_files.extend(error_files)
+			logging.error(f"{operation} {len(error_files)} file(s) FAILED: "
+			              f"{', '.join(error_files)}")
 			self.warning_msg.emit(
 				(f"{operation} {len(error_files)} files failed - please check 'Show Details' or the log.",
 				 "\n".join(error_files)))

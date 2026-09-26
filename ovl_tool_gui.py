@@ -526,6 +526,22 @@ class MainWindow(window.MainWindow):
 
 	def save(self, filepath):
 		"""Saves ovl to file_widget.filepath, clears dirty flag"""
+		# A file that failed to convert leaves its loader half built.  Saving
+		# anyway rewrites that asset's region of the .aux with garbage - textures
+		# come out as rainbow block noise - while every later message still reads
+		# SUCCESS.  Measured on vanilla BLDG_Classic_Materials.ovl: one texture
+		# injected with a png tile missing rewrote 36% of its 28 MB aux.
+		# reporter.failed_files is reset per operation, so this only ever reflects
+		# the most recent one.
+		failed = list(getattr(self.ovl_data.reporter, "failed_files", ()) or ())
+		if failed:
+			logging.error(f"Refusing to save: {len(failed)} file(s) failed to convert")
+			self.showerror(
+				"Refusing to save: %d file(s) failed to convert - saving now would "
+				"write corrupt data into the .aux. Fix or remove them and inject "
+				"again." % len(failed),
+				details=chr(10).join(str(f) for f in failed))
+			return
 		commands = {"update_aux" : self.cfg.get("update_aux")}
 		if not self.suppress_popups:
 			self.run_in_threadpool(self.ovl_data.save, (self.set_clean, self.run_current_game), filepath, commands=commands)

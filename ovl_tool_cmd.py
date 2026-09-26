@@ -186,6 +186,13 @@ def cmd_new(args: argparse.Namespace) -> None:
     except Exception as e:
         die(f"OvlFile.create failed: {e!r}")
 
+    # See cmd_inject: a file that failed to convert leaves a half-built loader, and
+    # saving it writes garbage into that asset's .aux region under a SUCCESS message.
+    failed = list(getattr(ovl.reporter, "failed_files", ()) or ())
+    if failed and not getattr(args, "allow_partial", False):
+        die("refusing to save: %d file(s) failed to convert: %s"
+            % (len(failed), ", ".join(failed)))
+
     commands = {"update_aux": args.update_aux}
     try:
         ovl.save(out_ovl, commands=commands)
@@ -343,6 +350,14 @@ def cmd_inject(args: argparse.Namespace) -> None:
             ovl.add_files(files_to_inject, common_root)
         except Exception as e:
             die(f"OvlFile.add_files failed: {e!r}")
+
+    # A file that failed to convert leaves its loader half-built.  Saving anyway
+    # rewrites that asset's region of the .aux with garbage - textures come out as
+    # rainbow block noise - and every later message still says SUCCESS.  Refuse.
+    failed = list(getattr(ovl.reporter, "failed_files", ()) or ())
+    if failed and not getattr(args, "allow_partial", False):
+        die("refusing to save: %d file(s) failed to convert: %s"
+            % (len(failed), ", ".join(failed)))
 
     # Decide output path
     if args.in_place:
@@ -995,6 +1010,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Set commands['update_aux']=True when saving.",
     )
     p_new.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Save even when some files failed to convert. Unsafe: a failed "
+             "texture leaves garbage in its .aux region (rainbow block noise).",
+    )
+    p_new.add_argument(
         "-f", "--force",
         action="store_true",
         help="Overwrite output file if it already exists.",
@@ -1075,6 +1096,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--update-aux",
         action="store_true",
         help="Set commands['update_aux']=True when saving.",
+    )
+    p_inj.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Save even when some files failed to convert. Unsafe: a failed "
+             "texture leaves garbage in its .aux region (rainbow block noise).",
     )
     p_inj.add_argument(
         "--update",
