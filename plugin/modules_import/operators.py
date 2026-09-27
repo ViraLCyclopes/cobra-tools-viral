@@ -130,6 +130,10 @@ class ImportMS2(BulkImportOp):
 		name="Load from Libraries",
 		description="Check Blender's asset libraries for materials; may be very slow",
 		default=False)
+	import_fur_psys: BoolProperty(
+		name="Add Fur Particle Systems",
+		description="Add a hair particle system to each fur shell, for combing fur. One hair per vertex with interpolated children, so a fur species adds tens of thousands of parent hairs and can peg the GPU or lock up the viewport. Only needed for combing, not for inspecting or re-exporting",
+		default=False)
 
 
 class ImportSPL(BulkImportOp):

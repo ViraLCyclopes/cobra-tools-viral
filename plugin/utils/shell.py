@@ -443,6 +443,12 @@ def hair_angle_for_verts(ref_vert, other_vert, hair_directions, loop_coord_kd):
 
 def gauge_uv_factors(shell_ob, fin_ob):
 	logging.info(f"Gauging UV scale for {fin_ob.name} from {shell_ob.name}")
+	if not shell_ob.particle_systems:
+		# Importing the fur particle systems is optional (see ImportMS2's
+		# "Add Fur Particle Systems"), and hair_length only exists on one. The
+		# scales it would derive are for combing fur, so skip rather than raise -
+		# indexing [0] here aborted the whole import with an IndexError.
+		return f"Skipped UV scale for {shell_ob.name}: no fur particle system"
 	hair_length = shell_ob.particle_systems[0].settings.hair_length
 
 	shell_me = shell_ob.data

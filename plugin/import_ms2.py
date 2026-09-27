@@ -18,7 +18,7 @@ from plugin.utils.object import create_ob, create_scene, create_collection, set_
 from generated.formats.ms2 import Ms2File
 
 
-def load(reporter, filepath: str = "", use_custom_normals: bool = False, mirror_mesh: bool = False, quadrify = True, merge_vertices: bool = True, load_libraries : bool = False):
+def load(reporter, filepath: str = "", use_custom_normals: bool = False, mirror_mesh: bool = False, quadrify = True, merge_vertices: bool = True, load_libraries : bool = False, import_fur_psys: bool = False):
 	start_time = time.time()
 	in_dir, ms2_name = os.path.split(filepath)
 	ms2_basename = os.path.splitext(ms2_name)[0]
@@ -131,7 +131,14 @@ def load(reporter, filepath: str = "", use_custom_normals: bool = False, mirror_
 					except:
 						logging.exception("Some mesh data failed")
 				# we can't assume that the first ob referencing this mesh has fur already
-				if ms2.context.version > 32 and is_shell(b_ob):
+				if import_fur_psys and ms2.context.version > 32 and is_shell(b_ob):
+					# OFF by default: add_psys asks for one hair per vertex with
+					# INTERPOLATED children, so a fur species means tens of
+					# thousands of parent hairs across its shell LODs (measured:
+					# 26.5k on vanilla Pyroraptor, 27.6k on a Planet Zoo port).
+					# Evaluating and drawing that pegs the GPU and can lock up the
+					# viewport on import, and it is only needed for COMBING fur -
+					# not for inspecting or re-exporting a mesh.
 					logging.debug(f"{b_ob.name} has shells, adding psys")
 					add_psys(b_ob, mesh.fur_length)
 			# show lod 0, hide the others

@@ -24,6 +24,124 @@ COUNT_AFTER_MASK = 0x40      # count+flag pair, relative to the mask start
 SEARCH_BACK = 0x4000
 RECORD_SIZE = 0x48           # mask .. 0x40 count .. 0x44 flag .. end
 
+# The whole struct the record is the tail of. See build_container.
+CONTAINER_SIZE = 0x80
+MASK_FIELD = 0x20            # each mask field is 0x20 bytes, so 256 bones max
+TRA_MASK_AT = 0x18
+ROT_MASK_AT = 0x38
+SCL_MASK_AT = 0x58
+COUNT_AT = 0x78
+MASK_KINDS = (("translation", TRA_MASK_AT),
+			  ("rotation", ROT_MASK_AT),
+			  ("scale", SCL_MASK_AT))
+
+
+def build_container(num_tracks, rotation=(), translation=(), scale=(), flag=1):
+	"""Construct the whole 0x80 struct that precedes a compressed ManiBlock's blob.
+
+	`build_record` covers only its last 0x48. That is enough to EDIT a vanilla
+	container, because the part it leaves out is already in the file, and it is
+	not enough to WRITE one: the translation mask sits 0x20 earlier, and a
+	container emitted without it stores every bone's translation in the ACL blob
+	with its mask bit clear. That is the same silent half-change as an unmasked
+	rotation - valid file, every offline check green, nothing moves in game.
+
+	Layout, measured over 605 shipped clips from 32 bundles on rigs of 142, 170,
+	172, 175, 206 and 212 bones:
+
+		0x00  0x18 zero bytes (three qwords the runtime fills in at load)
+		0x18  translation mask, ceil(num_tracks/64) qwords, zero to 0x20
+		0x38  rotation mask,    same shape   <- the region build_record builds
+		0x58  scale mask,       same shape   (zero on every rig measured, all of
+		      which have has_scale false)
+		0x78  uint32 num_tracks
+		0x7C  uint32 flag
+
+	**605/605 rebuild BYTE-IDENTICALLY from the three sub-track sets, the bone
+	count and the flag.** Nothing else in the struct varies.
+
+	**The scale mask is NOT keyed the same way as the other two.** Rotation and
+	translation carry what the ACL blob stores; scale carries what the ManiInfo's
+	`scl_channel_to_bone` declares, even where ACL then strips every one of them.
+	Measured 1137/1137 with no exceptions - see `acl_writer.container_masks`,
+	which is where a writer should get all three from.
+
+	Nothing on a scale-free rig can tell those apart, so the first 1042 clips
+	measured here said nothing about it: Acrocanthosaurus and friends have
+	`has_scale == False` everywhere. Deinosuchus separates them.
+
+	Note that this is the AUTHORING convention, verified. Whether the runtime
+	honours the scale mask is untested: Deinosuchus does not scale bones in game,
+	because its prefab does not enable `BoneScaling`, so the engine never reads
+	the field on the one rig that populates it.
+
+	The container sits at align8 after the block's channel tables and the ACL
+	blob at align16 after the container, which is why the gap between the two is
+	always 0x80 or 0x88 - see `find_container`.
+
+	`flag` is the one field no measurement explains: 592 of the 605 carry 1, and
+	`baryonyx$partial_mouth01` carries 0 where `dimetrodon$partial_mouth01` -
+	same role, same shape - carries 1, so it is not a function of the clip. 1 is
+	the default because it is the overwhelming majority and because every clip
+	that poses no bone at all is among the zeros, which a from-scratch clip never
+	is.
+
+	Each of `rotation` / `translation` / `scale` is the set of bones whose
+	sub-track of that kind the ACL blob actually stores - constant or animated,
+	i.e. `sub_track_types(...) != 0`. A sub-track stored without its bit set here
+	is inert in game.
+	"""
+	nw = mask_words(num_tracks)
+	if nw * 8 > MASK_FIELD:
+		raise ValueError(f"{num_tracks} bones needs {nw} mask qwords, which would "
+						 f"overrun the {MASK_FIELD:#x}-byte mask field")
+	if flag not in (0, 1):
+		raise ValueError(f"container flag is {flag}; vanilla only ever has 0 or 1")
+	container = bytearray(CONTAINER_SIZE)
+	for bones, offset in ((translation, TRA_MASK_AT), (rotation, ROT_MASK_AT),
+						  (scale, SCL_MASK_AT)):
+		words = [0] * nw
+		for b in bones:
+			if not 0 <= b < num_tracks:
+				raise ValueError(f"bone {b} outside this clip's {num_tracks} tracks")
+			words[b >> 6] |= 1 << (b & 63)
+		struct.pack_into(f"<{nw}Q", container, offset, *words)
+	struct.pack_into("<II", container, COUNT_AT, num_tracks, flag)
+	return bytes(container)
+
+
+def find_container(data, blob_offset, num_tracks):
+	"""File offset of the 0x80 container preceding the ACL blob at `blob_offset`.
+
+	The container is at align8 after the channel tables and the blob at align16
+	after the container, so the gap is 0x80 when the container starts 16-aligned
+	in buffer coordinates and 0x88 when it starts 8 past. Those are the only two
+	possibilities, and the bone count at +0x78 tells them apart - no search, and
+	no dependence on knowing the ManiBlock's own start.
+
+	Returns None when neither candidate carries the count, which is what a
+	non-transform blob or an uncompressed block looks like.
+	"""
+	for gap in (CONTAINER_SIZE, CONTAINER_SIZE + 8):
+		start = blob_offset - gap
+		if start < 0 or start + CONTAINER_SIZE > len(data):
+			continue
+		count, flag = struct.unpack_from("<II", data, start + COUNT_AT)
+		if count == num_tracks and flag in (0, 1):
+			return start
+	return None
+
+
+def read_container(data, start, num_tracks):
+	"""Unpack a container into its three bone sets, the count and the flag."""
+	nw = mask_words(num_tracks)
+	out = {}
+	for kind, offset in MASK_KINDS:
+		words = list(struct.unpack_from(f"<{nw}Q", data, start + offset))
+		out[kind] = [b for b in range(num_tracks) if (words[b >> 6] >> (b & 63)) & 1]
+	out["num_tracks"], out["flag"] = struct.unpack_from("<II", data, start + COUNT_AT)
+	return out
+
 
 def build_record(num_tracks, bones):
     """Construct a per-clip bone-mask record from scratch.
