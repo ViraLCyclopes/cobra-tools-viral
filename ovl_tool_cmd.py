@@ -19,6 +19,7 @@ Subcommands:
   motiongraph-grow-null-prefix - experimental fixed-pool logical array growth
   motiongraph-retarget-clip - repoint references to an existing same-pool clip string
   motiongraph-string-slot   - replace text within one existing string allocation
+  motiongraph-revert-audio  - put renamed sound events back on the donor's stock names
 
 Examples:
   ovl_tool_cmd.py extract -i path/to/main.ovl 
@@ -964,6 +965,110 @@ def cmd_motiongraph_string_slot(args: argparse.Namespace) -> None:
     logging.success("Wrote and reloaded staged family: %s", report.output)
 
 
+def cmd_motiongraph_revert_audio(args: argparse.Namespace) -> None:
+    """Put a renamed species' motiongraph back on the donor's stock sound events.
+
+    The point is publishing a copy of a mod that does NOT depend on the custom
+    audio chain - no built banks, no registry fragment, no loader. So this asks
+    nothing of the mod: the only thing it reads besides the graph is the game's
+    own stock registry, and --no-verify drops even that.
+    """
+    from pathlib import Path
+    from source.formats.motiongraph import audio_events
+    from source.formats.motiongraph.staging import copy_motiongraph_family
+    from source.formats.motiongraph.static_patch import apply_string_renames
+
+    game = resolve_game_label(args.game)
+    source = Path(args.ovl)
+    if args.prefix == args.donor:
+        die("--prefix and --donor are the same; there is nothing to revert")
+
+    try:
+        names = audio_events.scan_graph_event_names(source, args.prefix, game)
+    except Exception as exc:
+        die(f"Could not read audio event names: {exc}")
+    if not names:
+        die(f"No '{args.prefix}_*' audio event names in this motiongraph - "
+            f"either it was never renamed, or the prefix is wrong")
+
+    stock_ids = None
+    if args.game_root:
+        try:
+            stock_ids = audio_events.stock_event_ids(Path(args.game_root), game)
+        except Exception as exc:
+            die(f"Could not read the stock audio registry: {exc}")
+    elif not args.no_verify:
+        die("Pass --game-root <game folder> to verify each stock target exists, "
+            "or --no-verify to revert without checking")
+
+    classified = audio_events.classify_revert(names, args.prefix, args.donor, stock_ids)
+    wanted = None
+    if args.only:
+        wanted = {token.strip() for token in args.only.split(",") if token.strip()}
+
+    plan, unrestorable, deselected = [], [], []
+    for name, target, restorable in classified:
+        suffix = name[len(args.prefix) + 1:]
+        if wanted is not None and name not in wanted and suffix not in wanted:
+            deselected.append((name, target))
+            continue
+        if not restorable:
+            unrestorable.append((name, target))
+            continue
+        plan.append((name, target))
+
+    logging.info("%d '%s_*' event names in the graph", len(classified), args.prefix)
+    for name, target in plan:
+        logging.info("  revert  %s -> %s", name, target)
+    for name, target in unrestorable:
+        logging.warning("  KEEP    %s - no stock event named %s; this suffix is "
+                        "the mod's own invention and has nothing to fall back to",
+                        name, target)
+    for name, _target in deselected:
+        logging.info("  skip    %s - not in --only", name)
+
+    if not plan:
+        die("Nothing to revert: every name was deselected or has no stock equivalent")
+    if args.dry_run:
+        logging.success("Dry run: %d names would be reverted, %d kept",
+                        len(plan), len(unrestorable) + len(deselected))
+        return
+
+    if args.stage_dir:
+        stage = Path(args.stage_dir)
+        if stage.exists() and any(stage.iterdir()) and not args.force:
+            die(f"Stage directory is not empty: {stage} (use --force to replace it)")
+        try:
+            copy_motiongraph_family(source, stage)
+        except Exception as exc:
+            die(f"Could not stage the archive family: {exc}")
+        output = stage / source.name
+        logging.info("Staged the complete archive family into %s", stage)
+    elif args.output:
+        output = Path(args.output)
+    else:
+        die("Pass --stage-dir <empty folder> (recommended) or -o <staged OVL>")
+
+    try:
+        report = apply_string_renames(source, output, plan, game=game)
+    except Exception as exc:
+        die(f"motiongraph audio revert failed: {exc}")
+    logging.success(
+        "Reverted %d audio event names to '%s_*' (%d in place, %d relocated, "
+        "%d fragments repointed)",
+        len(plan), args.donor, report.in_place, report.relocated,
+        report.fragments_repointed,
+    )
+    if unrestorable:
+        logging.warning("%d mod-invented event name(s) left as they were: %s",
+                        len(unrestorable), ", ".join(n for n, _ in unrestorable))
+    logging.success("Wrote and reloaded staged family: %s", report.output)
+    logging.success(
+        "Deploy the .ovl and its companions as one unit. Drop the mod's "
+        "<Mod>/Audio/*.bnk and *.wmetasb.add too - with the graph on stock names "
+        "they are dead weight, and re-run the registry merge once they are gone.")
+
+
 # -----------------------------------------------------------------------------
 # Argument parsing
 # -----------------------------------------------------------------------------
@@ -1366,6 +1471,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_mgstr.add_argument("--force", action="store_true", help="Replace the staged OVL.")
     p_mgstr.set_defaults(func=cmd_motiongraph_string_slot)
+
+    # motiongraph-revert-audio
+    p_mgrev = sub.add_parser(
+        "motiongraph-revert-audio",
+        help="Put a renamed species' sound events back on the donor's stock names.",
+    )
+    p_mgrev.add_argument("ovl", help="Pristine source species OVL; never overwritten.")
+    p_mgrev.add_argument("--prefix", required=True,
+                         help="Prefix the graph uses now, e.g. UltimasaurusCE.")
+    p_mgrev.add_argument("--donor", required=True,
+                         help="Stock species to restore, e.g. IndominusRex.")
+    p_mgrev.add_argument("--stage-dir",
+                         help="Empty folder; the complete archive family is copied here "
+                              "and patched. Easier than preparing -o yourself.")
+    p_mgrev.add_argument("-o", "--output",
+                         help="Same-named OVL in a staged family you prepared already.")
+    p_mgrev.add_argument("--game-root",
+                         help="Game folder (the one holding Win64/ovldata), so each stock "
+                              "target can be checked against the shipped audio registry.")
+    p_mgrev.add_argument("--no-verify", action="store_true",
+                         help="Revert without a game folder; skips the stock-event check.")
+    p_mgrev.add_argument("--only",
+                         help="Comma-separated names or suffixes to revert; everything "
+                              "else keeps its custom name. Use for a mixed mod that "
+                              "replaces some sounds and leaves others stock.")
+    p_mgrev.add_argument("--dry-run", action="store_true",
+                         help="List what would change and stop.")
+    p_mgrev.add_argument(
+        "-g", "--game", default="Jurassic World Evolution 3",
+        choices=game_vals if game_vals else None,
+    )
+    p_mgrev.add_argument("--force", action="store_true",
+                         help="Allow a non-empty --stage-dir.")
+    p_mgrev.set_defaults(func=cmd_motiongraph_revert_audio)
 
     return parser
 

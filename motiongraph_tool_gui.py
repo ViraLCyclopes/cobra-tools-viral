@@ -69,6 +69,13 @@ from source.formats.motiongraph.staging import (
 	copy_motiongraph_family, motiongraph_family)
 
 
+# Audio Events tab directions. Renaming gives a species its own voice; reverting
+# puts the donor's stock names back so a published copy needs no custom-audio
+# chain at all - no proxy dll, no loader mod, no banks in the mod's Audio folder.
+AUDIO_RENAME = "rename"
+AUDIO_REVERT = "revert"
+
+
 def describe_motiongraph_field(path: str, kind: str = "") -> str:
 	"""Return a user-facing explanation without overstating unknown semantics."""
 	name = (path or "").lower()
@@ -1413,9 +1420,26 @@ class MainWindow(window.MainWindow):
 			"<b>Not every name is safe to rename.</b> Some resolve from SHARED banks used by "
 			"several species; renaming one orphans the sound in both directions and it goes "
 			"silent with no error. Scan first - those are shown greyed out and cannot be ticked."
+			"<br><br><b>Revert</b> goes the other way, for publishing a copy that needs none of "
+			"the custom-audio chain - no dll, no loader mod, no banks in <i>Audio/</i>. Stock "
+			"names resolve straight out of the game's own audio OVLs."
 		)
 		info.setWordWrap(True)
 		layout.addWidget(info)
+
+		self.audio_direction_box = QtWidgets.QComboBox()
+		self.audio_direction_box.addItem(
+			"Give this species its own voice  (donor -> your prefix)", AUDIO_RENAME)
+		self.audio_direction_box.addItem(
+			"Revert to the donor's stock sounds  (your prefix -> donor)", AUDIO_REVERT)
+		self.audio_direction_box.setToolTip(
+			"Revert reads only the graph and the game's shipped audio registry. It needs "
+			"neither the mod's banks nor the audio kit, so it still works after you have "
+			"deleted them.")
+		self.audio_direction_box.currentIndexChanged.connect(self.audio_direction_changed)
+		direction_row = QtWidgets.QFormLayout()
+		direction_row.addRow("Direction", self.audio_direction_box)
+		layout.addLayout(direction_row)
 
 		form = QtWidgets.QFormLayout()
 		self.audio_game = QtWidgets.QLineEdit()
@@ -1534,6 +1558,7 @@ class MainWindow(window.MainWindow):
 		)
 		note.setWordWrap(True)
 		layout.addWidget(note)
+		self.audio_direction_changed()
 		scroll = QtWidgets.QScrollArea()
 		scroll.setWidgetResizable(True)
 		scroll.setWidget(page)
@@ -3137,10 +3162,34 @@ class MainWindow(window.MainWindow):
 		self.status_bar.showMessage(message, 25000)
 		logging.info(message)
 
+	def audio_direction(self):
+		return self.audio_direction_box.currentData()
+
+	def audio_direction_changed(self):
+		"""A direction change invalidates the preview - the list means something else now."""
+		self.audio_scan_identity = None
+		self.audio_list.clear()
+		reverting = self.audio_direction() == AUDIO_REVERT
+		self.audio_list.setHeaderLabels([
+			"Event name in graph",
+			"Will become",
+			"Restore?" if reverting else "Rename?",
+		])
+		self.audio_apply.setText(
+			"Revert ticked events to stock in staged family" if reverting
+			else "Rename ticked events in staged family")
+		# A fragment declares events a mod's OWN bank answers. Reverting ships no
+		# bank, so there is nothing to declare.
+		self.audio_fragment.setEnabled(not reverting)
+		self.audio_fragment.setToolTip(
+			"Not used when reverting - a stock-sound copy ships no bank and needs no "
+			"registry fragment." if reverting else "")
+
 	def scan_audio_events(self):
 		try:
 			donor = self.audio_donor.text().strip()
 			prefix = self.audio_prefix.text().strip()
+			reverting = self.audio_direction() == AUDIO_REVERT
 			if not donor:
 				raise ValueError("Enter the donor species, e.g. Indoraptor")
 			if not prefix:
@@ -3149,26 +3198,40 @@ class MainWindow(window.MainWindow):
 			if not (game_root / "Win64" / "ovldata").is_dir():
 				raise ValueError("Choose the game folder (the one containing Win64/ovldata)")
 
+			# The graph currently speaks whichever prefix we are moving AWAY from.
+			current = prefix if reverting else donor
 			names = audio_events.scan_graph_event_names(
-				self.source_path(), donor, DEFAULT_GAME)
+				self.source_path(), current, DEFAULT_GAME)
 			if not names:
-				raise ValueError("No '%s_*' audio event names in this motiongraph" % donor)
-			owned_ids = audio_events.donor_event_ids(game_root, donor, DEFAULT_GAME)
-			classified = audio_events.classify(names, donor, owned_ids)
+				raise ValueError(
+					"No '%s_*' audio event names in this motiongraph%s"
+					% (current, " - has it been renamed yet?" if reverting else ""))
+
+			if reverting:
+				# Verified against the STOCK registry, not the mod's bank: the bank
+				# may be gone already, and shared-bank sounds are legitimate targets.
+				stock_ids = audio_events.stock_event_ids(game_root, DEFAULT_GAME)
+				rows = [(name, target, ok, "Yes - the stock game answers it" if ok
+							else "No - no stock event of that name to go back to")
+						for name, target, ok
+						in audio_events.classify_revert(names, prefix, donor, stock_ids)]
+			else:
+				owned_ids = audio_events.donor_event_ids(game_root, donor, DEFAULT_GAME)
+				rows = [(name, "%s_%s" % (prefix, name[len(donor) + 1:]), owned,
+							"Yes - your bank answers it" if owned
+							else "No - a SHARED bank owns this sound")
+						for name, owned in audio_events.classify(names, donor, owned_ids)]
+
 			self.audio_scan_identity = (self.loaded_identity, donor, prefix,
-				str(game_root.resolve()))
+				str(game_root.resolve()), self.audio_direction())
 
 			self.audio_list.clear()
 			safe = 0
-			for name, owned in classified:
-				suffix = name[len(donor) + 1:]
-				item = QtWidgets.QTreeWidgetItem([
-					name,
-					("%s_%s" % (prefix, suffix)) if owned else "stays as-is",
-					"Yes - your bank answers it" if owned
-					else "No - a SHARED bank owns this sound",
-				])
-				if owned:
+			for name, target, usable, why in rows:
+				item = QtWidgets.QTreeWidgetItem(
+					[name, target if usable else "stays as-is", why])
+				if usable:
+					item.setData(0, QtCore.Qt.UserRole, target)
 					item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
 					item.setCheckState(0, QtCore.Qt.Checked)
 					safe += 1
@@ -3179,45 +3242,72 @@ class MainWindow(window.MainWindow):
 			for column in range(3):
 				self.audio_list.resizeColumnToContents(column)
 			self.status_bar.showMessage(
-				"%d audio events: %d safe to rename, %d owned by shared banks"
-				% (len(names), safe, len(names) - safe), 15000
+				("%d audio events: %d can go back to stock, %d are this mod's own "
+				 "invention and have no stock equivalent" if reverting
+				 else "%d audio events: %d safe to rename, %d owned by shared banks")
+				% (len(rows), safe, len(rows) - safe), 15000
 			)
 		except Exception as exc:
 			self.showerror(str(exc))
+
+	def ticked_audio_pairs(self):
+		"""(current, target) for every ticked row, longest source first.
+
+		The target is read off the item rather than recomputed, so one code path
+		serves both directions and the applied pairs are exactly what the user was
+		shown in the preview.
+		"""
+		pairs = []
+		for index in range(self.audio_list.topLevelItemCount()):
+			item = self.audio_list.topLevelItem(index)
+			if not (item.flags() & QtCore.Qt.ItemIsUserCheckable):
+				continue
+			if item.checkState(0) != QtCore.Qt.Checked:
+				continue
+			target = item.data(0, QtCore.Qt.UserRole)
+			if target:
+				pairs.append((item.text(0), target))
+		pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+		return pairs
 
 	def apply_audio_rename(self):
 		try:
 			donor = self.audio_donor.text().strip()
 			prefix = self.audio_prefix.text().strip()
+			direction = self.audio_direction()
 			game_root = Path(self.audio_game.text().strip()).resolve()
-			if self.audio_scan_identity != (self.loaded_identity, donor, prefix, str(game_root)):
-				raise ValueError("Audio preview is stale; scan again after changing source, donor, prefix, or game folder")
-			pairs = []
-			for index in range(self.audio_list.topLevelItemCount()):
-				item = self.audio_list.topLevelItem(index)
-				if not (item.flags() & QtCore.Qt.ItemIsUserCheckable):
-					continue
-				if item.checkState(0) != QtCore.Qt.Checked:
-					continue
-				name = item.text(0)
-				pairs.append((name, "%s_%s" % (prefix, name[len(donor) + 1:])))
+			if self.audio_scan_identity != (self.loaded_identity, donor, prefix,
+					str(game_root), direction):
+				raise ValueError("Audio preview is stale; scan again after changing source, donor, prefix, direction, or game folder")
+			pairs = self.ticked_audio_pairs()
 			if not pairs:
 				raise ValueError("Scan first, then tick at least one event")
-			pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
 
 			report = apply_string_renames(
 				self.source_path(), self.output_path(), pairs, game=DEFAULT_GAME)
-			message = ("Renamed %d audio events in place and relocated %d; "
+			verb = "Reverted" if direction == AUDIO_REVERT else "Renamed"
+			message = ("%s %d audio events in place and relocated %d; "
 						   "%d fragments repointed; staged family verified"
-						   % (report.in_place, report.relocated, report.fragments_repointed))
+						   % (verb, report.in_place, report.relocated,
+							  report.fragments_repointed))
 			self.status_bar.showMessage(message, 15000)
 			logging.info(message)
+			if direction == AUDIO_REVERT:
+				logging.info(
+					"The graph is back on stock names. Drop the mod's Audio/*.bnk and "
+					"*.wmetasb.add as well, then re-run the registry merge - a stock-sound "
+					"copy needs no bank, no fragment and no loader.")
 			self.census_guard("audio event rename", expect_added=0, expect_removed=0)
 		except Exception as exc:
 			self.showerror(str(exc))
 
 	def write_audio_fragment(self):
 		try:
+			if self.audio_direction() == AUDIO_REVERT:
+				raise ValueError(
+					"A registry fragment declares the events YOUR bank answers. A reverted "
+					"copy ships no bank, so it needs no fragment - delete the mod's existing "
+					"one and re-run the merge instead.")
 			donor = self.audio_donor.text().strip()
 			prefix = self.audio_prefix.text().strip()
 			suffixes = []

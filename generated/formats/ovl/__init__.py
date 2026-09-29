@@ -918,7 +918,7 @@ class OvlFile(Header):
 			# 			# e.g. albertosaurus_juvenile.mdl2 [3060300434] and albertosaurus_juvenile.fgm [3060300434]
 			# 			logging.warning(f"Djb2 hash collision for {name} [{djb_hash}]")
 			dependencies_ext = [self.names.get_str_at(i).replace(":", ".") for i in self.dependencies["ext_raw"]]
-			self.hash_table_local.update({h: b for b, h in zip(self.files_basename, self.files["file_hash"])})
+			self.hash_table_local.update({h: b.replace('"', '') for b, h in zip(self.files_basename, self.files["file_hash"])})
 
 			self.loaders = {}
 			if "only_types" in self.commands:

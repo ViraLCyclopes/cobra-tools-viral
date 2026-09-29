@@ -10,6 +10,15 @@ those orphans the sound in both directions: the shared bank no longer matches,
 and the new bank never had it. The sound goes silent with no error anywhere,
 which is why this module exists - so the UI can mark those names as unsafe
 instead of leaving it to memory.
+
+The reverse trip matters just as much. A modder who wants to publish a copy
+WITHOUT the custom-audio dependency has to put the donor's names back, or the
+graph fires ids no installed bank answers and the animal is mute. That direction
+cannot ask "does the prefix own this sound" - the mod's bank may already be
+deleted, and it never lived in an ``_events.ovl`` anyway: a mod ships the raw
+``<prefix>_events.bnk`` and a ``.wmetasb.add`` fragment in ``<Mod>/Audio/``. So
+reverting is verified against the STOCK REGISTRY instead, which declares every
+vanilla event including the ones shared banks own. See ``classify_revert``.
 """
 from __future__ import annotations
 
@@ -56,6 +65,9 @@ def scan_graph_event_names(source: Path, donor: str, game: str) -> list[str]:
     string pools instead would be faster but wrong: it also sweeps up material
     resources like ``<donor>_Variant_01_00`` and ``<donor>_VariantSet_Lux``,
     which are not sounds and must never appear in a rename list.
+
+    ``donor`` is whatever prefix the graph currently uses, so pass the MOD's
+    prefix when scanning a renamed graph for a revert.
     """
     source = Path(source)
     ovl = _open_ovl(source, game)
@@ -94,8 +106,11 @@ def _walk_chunks(data: bytes) -> dict[str, tuple[int, int]]:
 def event_ids_in_bank(aux_path: Path) -> set[int]:
     """EVENT object ids declared by a Wwise bank.
 
-    The real bank is the ``..._bnk_b.aux`` companion, not cobra's 84-byte .bnk
-    stub, and it must be read only as far as its chunks actually walk.
+    Inside a packed ``<Species>_events.ovl`` the real bank is the
+    ``..._bnk_b.aux`` companion, not cobra's 84-byte .bnk stub. A MOD ships the
+    bank loose instead, as ``<Mod>/Audio/<prefix>_events.bnk``, and that file is
+    a complete bank - ``BKHD`` then ``HIRC`` - so this reads either one. Only as
+    far as the chunks actually walk, in both cases.
     """
     raw = aux_path.read_bytes()
     end, off = 0, 0
@@ -151,9 +166,109 @@ def donor_event_ids(game_root: Path, donor: str, game: str) -> set[int]:
         return event_ids_in_bank(auxes[0])
 
 
+def find_mod_events_bank(mod_root: Path, prefix: str) -> Path | None:
+    """Locate a mod's LOOSE events bank: ``<Mod>/Audio/<prefix>_events.bnk``.
+
+    Mods do not ship an ``_events.ovl``; the raw bank and the ``.wmetasb.add``
+    registry fragment go straight into the mod's ``Audio`` folder. Accepts either
+    the mod root or the ``Audio`` folder itself, and matches case-insensitively
+    because the built banks are lowercased while the prefix usually is not.
+    """
+    mod_root = Path(mod_root)
+    wanted = f"{prefix}_events.bnk".lower()
+    for folder in (mod_root / "Audio", mod_root):
+        if not folder.is_dir():
+            continue
+        for candidate in folder.iterdir():
+            if candidate.is_file() and candidate.name.lower() == wanted:
+                return candidate
+    return None
+
+
+def stock_registry_path(game_root: Path) -> Path:
+    game_root = Path(game_root)
+    return (game_root / "Win64" / "ovldata" / "Content0" / "Audio" / "MetaData"
+            / "audiometadata.ovl")
+
+
+_REGISTRY_CACHE: dict[tuple[str, int, int], str] = {}
+
+
+def read_stock_registry(game_root: Path, game: str) -> str:
+    """The stock ``.wmetasb`` text, cached per file identity.
+
+    Unpacking ``audiometadata.ovl`` costs seconds, and both the fragment builder
+    and the revert classifier want the same text.
+    """
+    meta = stock_registry_path(game_root)
+    if not meta.is_file():
+        raise FileNotFoundError(f"Stock registry not found: {meta}")
+    stat = meta.stat()
+    key = (str(meta.resolve()), stat.st_size, int(stat.st_mtime))
+    cached = _REGISTRY_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    ovl = _open_ovl(meta, game)
+    previous = logging.root.manager.disable
+    with tempfile.TemporaryDirectory(prefix="vl_reg_") as tmp:
+        try:
+            logging.disable(logging.CRITICAL)
+            ovl.extract(tmp)
+        finally:
+            logging.disable(previous)
+        found = list(Path(tmp).glob("*.wmetasb"))
+        if not found:
+            raise FileNotFoundError("audiometadata.ovl held no .wmetasb")
+        registry = found[0].read_text(encoding="utf-8")
+    _REGISTRY_CACHE[key] = registry
+    return registry
+
+
+def stock_event_ids(game_root: Path, game: str) -> frozenset[int]:
+    """Every event id the STOCK registry declares, across all banks.
+
+    This is the oracle for "would the unmodded game post this sound". It is wider
+    than one species' own bank on purpose: a revert target such as
+    ``IndominusRex_SocialCall`` lives in a SHARED bank, and refusing to restore it
+    because the donor's bank does not own it would be exactly backwards.
+    """
+    registry = read_stock_registry(game_root, game)
+    return frozenset(
+        int(value) for value in re.findall(
+            r'(?:event_fnv|stop_start_fnv|start_fnv)="(\d+)"', registry)
+    )
+
+
 def classify(names: list[str], donor: str, owned_ids: set[int]) -> list[tuple[str, bool]]:
     """Tag each graph name as safe to rename (donor owns it) or not (shared bank)."""
     return [(n, fnv1_32(n) in owned_ids) for n in names]
+
+
+def classify_revert(names: list[str], prefix: str, donor: str,
+                    stock_ids: frozenset[int] | set[int] | None
+                    ) -> list[tuple[str, str, bool]]:
+    """Tag each ``<prefix>_*`` graph name with its stock target and whether it exists.
+
+    Returns ``(current_name, stock_target, restorable)``. Restorable means the
+    stock registry declares ``<donor>_<suffix>``, so putting the name back makes
+    the graph fire a sound the unmodded game already answers.
+
+    A name that is NOT restorable is one the modder invented - there is no stock
+    event of that suffix to fall back to. Reverting it would swap one dead id for
+    another, so the UI must not offer it as a fix.
+
+    ``stock_ids`` of ``None`` skips verification and marks everything restorable,
+    for the case where the game folder is not available.
+    """
+    plan = []
+    for name in names:
+        if not name.startswith(prefix + "_"):
+            continue
+        target = f"{donor}_{name[len(prefix) + 1:]}"
+        restorable = True if stock_ids is None else fnv1_32(target) in stock_ids
+        plan.append((name, target, restorable))
+    return plan
 
 
 def build_registry_fragment(game_root: Path, donor: str, prefix: str,
@@ -168,24 +283,7 @@ def build_registry_fragment(game_root: Path, donor: str, prefix: str,
 
     Returns (xml, evententry_rows, remapped_fnvs).
     """
-    game_root = Path(game_root)
-    meta = (game_root / "Win64" / "ovldata" / "Content0" / "Audio" / "MetaData"
-            / "audiometadata.ovl")
-    if not meta.is_file():
-        raise FileNotFoundError(f"Stock registry not found: {meta}")
-
-    ovl = _open_ovl(meta, game)
-    previous = logging.root.manager.disable
-    with tempfile.TemporaryDirectory(prefix="vl_reg_") as tmp:
-        try:
-            logging.disable(logging.CRITICAL)
-            ovl.extract(tmp)
-        finally:
-            logging.disable(previous)
-        found = list(Path(tmp).glob("*.wmetasb"))
-        if not found:
-            raise FileNotFoundError("audiometadata.ovl held no .wmetasb")
-        registry = found[0].read_text(encoding="utf-8")
+    registry = read_stock_registry(game_root, game)
 
     remap: dict[int, int] = {}
     for suffix in renamed_suffixes:
@@ -229,3 +327,16 @@ def rename_plan(names: list[str], donor: str, prefix: str) -> list[tuple[str, st
         suffix = name[len(donor) + 1:]
         plan.append((name, f"{prefix}_{suffix}"))
     return plan
+
+
+def revert_plan(names: list[str], prefix: str, donor: str) -> list[tuple[str, str]]:
+    """(current, stock) pairs putting a renamed graph back on the donor's voice.
+
+    The mirror of ``rename_plan``. Usually every target is SHORTER than what it
+    replaces, so these land as in-place slot patches, but a shorter mod prefix
+    than the donor's name is legal and those pairs relocate instead -
+    ``apply_string_renames`` sorts that out.
+    """
+    return [(name, f"{donor}_{name[len(prefix) + 1:]}")
+            for name in sorted(names, key=len, reverse=True)
+            if name.startswith(prefix + "_")]
