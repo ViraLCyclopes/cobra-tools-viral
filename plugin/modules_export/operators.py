@@ -232,13 +232,16 @@ class ExportManisSplice(ExportOp):
         description="Which actions to splice",
         items=(
             ('CHANGED', "Changed Only (Recommended)",
-             "Every action that differs from its bundle. Untouched clips are left "
-             "byte-identical - our encoder is not Frontier's, so re-encoding a clip "
-             "you did not edit loses quality for nothing"),
+             "Every action that differs from its bundle. Clips you did not edit keep "
+             "their source samples but are re-encoded once, because the bundle shares "
+             "one ACL database"),
             ('SELECTED', "Ticked Only",
-             "Only actions ticked for export in the Cobra panel"),
+             "Only actions ticked for export in the Cobra panel. Every other clip in "
+             "the bundle comes from the SOURCE bundle, so earlier edits not ticked "
+             "here are reverted in the output"),
             ('ACTIVE', "Active Action",
-             "Only the armature's active action"),
+             "Only the armature's active action. Every other clip in the bundle comes "
+             "from the SOURCE bundle, so earlier edits are reverted in the output"),
         ),
         default='CHANGED')
     unstrip: BoolProperty(

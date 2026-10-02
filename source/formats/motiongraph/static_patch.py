@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import struct
 import tempfile
 from dataclasses import dataclass
@@ -12,12 +13,18 @@ from generated.formats.ovl import OvlFile
 from .clone import (NUM_FRAGMENTS_OFFSET, POOLS_END_OFFSET,
                     UNCOMPRESSED_SIZE_OFFSET)
 from .surgical_growth import (_load_quiet, append_tail_pool_bytes,
-                              repoint_pool_end_fragments)
+                              observed_type_capacity, repoint_pool_end_fragments)
 from .staging import CandidatePublication, copy_motiongraph_family, validate_staged_pair
 
 
 DEFAULT_GAME = "Jurassic World Evolution 3"
 COMPRESSED_SIZE_OFFSET = 44
+# Appending STRINGS to the last type-2 pool past the archive's own largest pool is
+# game-verified (MegaraptorAnims 28,312 -> 28,723, 2026-10-02), and installed mods
+# load type-2 pools of 164,796 (UltimasaurusCE.ovl) up to 1,180,896. Object/table
+# growth keeps the archive bound: appending to a packed 48-byte Activity table
+# crashed (Tests F/F2).
+STRING_TAIL_CAPACITY = 200_000
 
 if not hasattr(logging, "success"):
     logging.success = logging.info  # type: ignore[attr-defined]
@@ -345,6 +352,75 @@ class RenameReport:
     fragments_repointed: int
 
 
+@dataclass(frozen=True)
+class ReusedStringSlot:
+    local_pool: int
+    offset: int
+    old_size: int
+    new_size: int
+
+
+def _reuse_unreferenced_clip_slot(ovl, static, payload: bytes):
+    """Reuse one orphaned clip-name slot without growing or shifting a pool.
+
+    Content renaming can leave old donor clip strings behind after their
+    fragments move elsewhere. Only accept complete clip-shaped strings inside
+    an entirely ASCII/NUL type-2 pool. Any fragment target within the slot
+    (including a suffix or its terminator) protects it. A root, dependency or
+    fragment SOURCE in the pool disqualifies the entire pool: it may hold a
+    structure or resource rather than just standalone strings.
+
+    This is deliberately narrower than treating unreferenced bytes or zero
+    runs as free memory. No general pool limit is relaxed.
+    """
+    ovs = static.content
+    choices = []
+    for index, pool in enumerate(ovs.pools):
+        if int(pool.type) != 2:
+            continue
+        blob = pool.data.getvalue()
+        if not blob or any(byte != 0 and not 32 <= byte <= 126 for byte in blob):
+            continue
+        global_index = next(i for i, p in enumerate(ovl.pools) if p is pool)
+        # Protect both numbering interpretations across archive tables. This
+        # may reject spare space, but cannot make a live allocation reusable.
+        indices = {index, global_index}
+        targets, structured = set(), False
+        for archive in ovl.archives:
+            for fragment in archive.content.fragments:
+                if int(fragment['link_pool']) in indices:
+                    structured = True
+                if int(fragment['struct_pool']) in indices:
+                    targets.add(int(fragment['struct_offset']))
+            for root in archive.content.root_entries:
+                if int(root['struct_ptr']['pool_index']) in indices:
+                    structured = True
+        for dependency in ovl.dependencies:
+            if int(dependency['link_ptr']['pool_index']) in indices:
+                structured = True
+        if structured or not targets:
+            continue
+        start = 0
+        while start < len(blob):
+            end = blob.find(b'\0', start)
+            if end < 0:
+                break  # Never reclaim a string cut by a pool boundary.
+            text = blob[start:end]
+            if (end + 1 - start >= len(payload)
+                    and re.fullmatch(rb'[A-Za-z][A-Za-z0-9_]*[$@][A-Za-z0-9_]+', text)
+                    and not any(start <= offset <= end for offset in targets)):
+                choices.append((end + 1 - start, index, start))
+            start = end + 1
+    if not choices:
+        return None
+    size, index, offset = min(choices)
+    pool = ovs.pools[index]
+    pool.data.seek(offset)
+    pool.data.write(payload + b'\0' * (size - len(payload)))
+    pool.data.seek(0)
+    return ReusedStringSlot(index, offset, int(pool.size), int(pool.size))
+
+
 def relocate_strings(source: Path, output: Path, pairs, *,
                      game: str = DEFAULT_GAME) -> RelocateReport:
     """Rename strings that do NOT fit their existing slot, by ALLOCATING new ones.
@@ -362,10 +438,11 @@ def relocate_strings(source: Path, output: Path, pairs, *,
     Use it for the pairs `patch_string_slots` skipped as too long; short-enough
     renames are cheaper as in-place patches.
 
-    LIMIT: allocation goes in the LAST type-2 pool, and on some archives that pool
-    is already full to its observed capacity. There is no page-creation support,
-    so such a file simply cannot take a longer name - that is reported, not
-    guessed around.
+    Allocation first tries the LAST type-2 pool, bounded by STRING_TAIL_CAPACITY
+    (or the archive's own largest type-2 pool if that is bigger). If that is
+    exhausted, an unreferenced old clip-name slot in a string-only pool may be
+    reused without growth. If neither route fits, the edit fails; creating a new
+    pool remains unsupported.
     """
     source, output = _require_staged_output(source, output)
     ovl, static = _load_quiet(source, game)
@@ -379,6 +456,13 @@ def relocate_strings(source: Path, output: Path, pairs, *,
     old_fragment_count = int(static.num_fragments)
     static_index = ovl.archives.index(static)
     old_reservation = int(ovl.archives_meta[static_index].unk_0)
+
+    # Keep unmapped bytes intact. A reader/writer mismatch is a separate format
+    # problem, not permission to publish collateral changes during a rename.
+    original_static = _decompressed_static(source, ovl, static)
+    ovs.write_pools()
+    if ovs.write_archive() != original_static:
+        raise ValueError("STATIC does not round-trip unchanged; refusing string relocation")
 
     allocations, skipped, repointed = [], [], 0
     for source_text, target_text in pairs:
@@ -411,12 +495,17 @@ def relocate_strings(source: Path, output: Path, pairs, *,
             continue
         try:
             allocation = append_tail_pool_bytes(
-                ovl.pools, ovs.pools, 2, target_text.encode("ascii") + b"\0", alignment=16)
+                ovl.pools, ovs.pools, 2, target_text.encode("ascii") + b"\0", alignment=16,
+                page_size=max(observed_type_capacity(ovs.pools, 2), STRING_TAIL_CAPACITY))
         except ValueError as error:
-            skipped.append((source_text, str(error)))
-            continue
-        repoint_pool_end_fragments(fragments, allocation.local_pool,
-                                   allocation.old_size, allocation.new_size)
+            allocation = _reuse_unreferenced_clip_slot(
+                ovl, static, target_text.encode("ascii") + b"\0")
+            if allocation is None:
+                skipped.append((source_text, str(error) + "; no reusable orphaned clip-name slot fits"))
+                continue
+        if allocation.new_size > allocation.old_size:
+            repoint_pool_end_fragments(fragments, allocation.local_pool,
+                                       allocation.old_size, allocation.new_size)
         allocations.append(allocation)
         # recompute the mask: repoint_pool_end_fragments may have moved records
         mask = ((fragments["struct_pool"] == old_pool)

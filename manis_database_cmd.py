@@ -40,6 +40,10 @@ from source.formats.manis.splice import list_clip_blobs, read_blob_header
 QVVF = 12
 BULK_ALIGNMENT = 16
 MAX_ROTATION_DEGREES = 0.5
+# Every rebuild re-encodes every clip from the previous rebuild's output, so error
+# compounds. At ACL's default 0.01, 10 rebuilds reach ~1 deg of visible stepping;
+# 0.001 is game-verified smooth (UltimasaurusCE rest/idle, 2026-10-02).
+DEFAULT_PRECISION = 0.001
 
 
 def builder_path():
@@ -98,9 +102,8 @@ def build_database(streams, headers, bind, work_dir, parents, bind_values,
 	if not os.path.isfile(builder):
 		sys.exit(f"ACL database builder not found at '{builder}'. "
 				 f"Build acl_decoder/build_database.cmd or set COBRA_ACL_DATABASE.")
-	command = [builder, manifest, out_dir, "--bind", bind_file]
-	if precision is not None:
-		command += ["--precision", repr(precision)]
+	command = [builder, manifest, out_dir, "--bind", bind_file,
+			   "--precision", repr(DEFAULT_PRECISION if precision is None else precision)]
 	if medium_proportion is not None:
 		command += ["--medium", repr(medium_proportion)]
 	if low_proportion is not None:
@@ -548,8 +551,9 @@ def main():
 	ap.add_argument("--ms2", required=True,
 					help="skeleton supplying the bind pose used as ACL defaults")
 	ap.add_argument("--precision", type=float,
-					help="ACL error threshold in cm; looser values avoid the raw bit rate "
-						 "(index 31 in the stream) that vanilla never uses")
+					help=f"ACL error threshold in cm (default {DEFAULT_PRECISION}). Every "
+						 "rebuild re-encodes every clip, so a loose value compounds into "
+						 "visible stepping over repeated exports")
 	ap.add_argument("--medium", type=float,
 					help="fraction of keyframes moved to the medium-importance tier "
 						 "(ACL default 0.35). The tiers are the game's LOD streams - low "
@@ -577,10 +581,13 @@ def main():
 						 "speed a clip up that keeps every timing field consistent")
 	ap.add_argument("--resample-factor", type=float, default=0.5,
 					help="fraction of frames to keep (default 0.5 = twice as fast)")
-	ap.add_argument("--replace-clip", type=str,
-					help="clip NAME whose samples to replace from --jacl (Blender export)")
-	ap.add_argument("--jacl", type=str,
-					help="JACL sample file to read for --replace-clip")
+	ap.add_argument("--replace-clip", action="append", default=[],
+					help="clip NAME whose samples to replace from --jacl (Blender export). "
+						 "Repeatable, paired in order with --jacl: replace every edited "
+						 "clip in ONE rebuild, since each rebuild re-encodes the whole "
+						 "bundle and chaining them compounds the loss")
+	ap.add_argument("--jacl", action="append", default=[],
+					help="JACL sample file for the --replace-clip at the same position")
 	ap.add_argument("--hold-track", type=str, default="srb",
 					help="comma-separated bone names or track indices to keep at the "
 						 "template's values instead of taking them from --jacl. "
@@ -811,10 +818,14 @@ def main():
 				print(f"  store-sub: {clip_name} {group} - {len(tracks)} sub-tracks "
 					  f"now STORED ({'animated' if args.store_animate else 'constant'})")
 
-	resampled = None
+	retimes = []
+	if len(args.replace_clip) != len(args.jacl):
+		sys.exit(f"--replace-clip and --jacl must pair up: got {len(args.replace_clip)} "
+				 f"clip(s) and {len(args.jacl)} file(s)")
+	repeated = sorted({c for c in args.replace_clip if args.replace_clip.count(c) > 1})
+	if repeated:
+		sys.exit(f"--replace-clip names a clip more than once: {', '.join(repeated)}")
 	if args.replace_clip:
-		if not args.jacl:
-			sys.exit("--replace-clip needs --jacl")
 		bone_names = read_ms2_bone_names(args.ms2)
 		hold = resolve_tracks(args.hold_track or "", bone_names)
 		# The LOD nodes share srb's parentless, pre-rotated rest matrix and break the
@@ -823,16 +834,24 @@ def main():
 		hold += [i for i, n in enumerate(bone_names)
 				 if re.fullmatch(r".+_L\d+", n) and i not in hold]
 		hold = sorted(set(hold))
-		_unstripped = []
-		streams, resampled, new_duration = replace_clip_samples(
-			args.manis, streams, headers, args.replace_clip, args.jacl, hold,
-			unstrip=args.unstrip, unstripped_out=_unstripped)
-		if _unstripped:
-			_stored_for_mask.setdefault(args.replace_clip, []).extend(_unstripped)
+		for clip_name, jacl_path in zip(args.replace_clip, args.jacl):
+			_unstripped = []
+			streams, frames, new_duration = replace_clip_samples(
+				args.manis, streams, headers, clip_name, jacl_path, hold,
+				unstrip=args.unstrip, unstripped_out=_unstripped)
+			if frames is not None:
+				retimes.append((clip_name, frames, new_duration))
+			if _unstripped:
+				_stored_for_mask.setdefault(clip_name, []).extend(_unstripped)
 
 	if args.resample_clip:
-		streams, resampled, new_duration = resample_clip(
+		if args.resample_clip in args.replace_clip:
+			sys.exit(f"--resample-clip '{args.resample_clip}' is also being replaced; "
+					 f"resample the samples before exporting instead")
+		streams, frames, new_duration = resample_clip(
 			args.manis, streams, headers, args.resample_clip, args.resample_factor)
+		if frames is not None:
+			retimes.append((args.resample_clip, frames, new_duration))
 
 	with tempfile.TemporaryDirectory(prefix="jwe3_acl_db_") as work_dir:
 		bound, database, low, medium = build_database(
@@ -903,9 +922,8 @@ def main():
 
 	data = keys + pad_to(low) + pad_to(medium)
 
-	if resampled is not None:
-		data = retime_mani_info(data, args.resample_clip or args.replace_clip,
-								resampled, new_duration)
+	for clip_name, frames, new_duration in retimes:
+		data = retime_mani_info(data, clip_name, frames, new_duration)
 
 	with open(args.out, "wb") as fh:
 		fh.write(data)

@@ -190,6 +190,13 @@ def clip_defaults(values, bind, keep_all=False):
 		# animals crush and stretch.) Costs blob size; verify in game before
 		# relying on it.
 		kept = np.ones_like(stripped) if keep_all else ~stripped
+		if lo == 0:
+			# A stripped rotation is filled with its default, so it only strips if ACL
+			# reads the fill back as that default. ACL drops w and rebuilds it from
+			# xyz; a bind with w ~ 0 (Acro def_c_lipLwr_joint) rebuilds ~0.03 deg off
+			# and is STORED at precision 0.001. The value never reaches the file, so
+			# use identity, which rebuilds exactly.
+			out[~kept, 0:4] = (0.0, 0.0, 0.0, 1.0)
 		if not kept.any():
 			continue
 		held = np.nan_to_num(np.nanmax(block, axis=0), nan=0.0)

@@ -1,9 +1,11 @@
 """Splice authored actions back into a JWE3 .manis bundle.
 
 The JWE3 path, and NOT "Export Manis": `ManisFile.save()` writes uncompressed
-dtype 0 with no ACL blobs, dropping the database and limb data. Here each edited
-action is re-encoded self-contained and spliced into the source bundle, so every
-clip you did not touch stays byte-identical - rest03 included.
+dtype 0 with no ACL blobs, dropping the database and limb data. Here the edited
+actions replace their clips' samples and the bundle's shared ACL database is
+rebuilt once, so clips you did not touch keep their source samples but are
+re-encoded one time (~0.06 deg at the default precision). Always export from the
+original bundles: feeding an export back in as the source re-encodes again.
 
 Bones vanilla stripped are kept when you actually animated them, and their bone
 mask bits are set, which is what makes them move in game.
@@ -299,35 +301,35 @@ def _rebuild(src, out, edits, ms2_path, unstrip):
     alternative leaves the edited clip SELF-CONTAINED (has_database=0) while its
     original bulk is still in the database, and the engine then alternates between
     the two as it streams LOD tiers: the animal blinks between poses in game.
-    Correctness wins. One clip per invocation, chained.
+    Correctness wins.
+
+    All edits go into ONE rebuild. Chaining one rebuild per clip re-encoded every
+    clip once per edit, and the loss compounded into visible stepping (about 1 deg
+    after 10 rebuilds at the old 0.01 precision).
     """
     import sys, tempfile, shutil
     import manis_database_cmd
 
     enabled = 0
     with tempfile.TemporaryDirectory(prefix="cobra_splice_") as tmp:
-        current = src
+        step = os.path.join(tmp, "rebuilt.manis")
+        argv = ["manis_database_cmd.py", src, "--out", step, "--ms2", ms2_path]
         for n, (clip, values) in enumerate(edits.items()):
             jacl = os.path.join(tmp, f"clip{n}.jacl")
             write_jacl(jacl, values, 30.0003)
-            step = os.path.join(tmp, f"step{n}.manis")
-            argv = [
-                "manis_database_cmd.py", current, "--out", step,
-                "--ms2", ms2_path,
-                "--replace-clip", clip, "--jacl", jacl,
-            ]
-            if unstrip:
-                argv.append("--unstrip")
-            saved = sys.argv
-            try:
-                sys.argv = argv
-                rc = manis_database_cmd.main()
-            except SystemExit as err:
-                raise RuntimeError(f"{clip}: rebuild failed - {err}") from err
-            finally:
-                sys.argv = saved
-            if rc not in (0, None):
-                raise RuntimeError(f"{clip}: rebuild returned {rc}")
-            current = step
-        shutil.copyfile(current, out)
+            argv += ["--replace-clip", clip, "--jacl", jacl]
+        if unstrip:
+            argv.append("--unstrip")
+        clips = ", ".join(edits)
+        saved = sys.argv
+        try:
+            sys.argv = argv
+            rc = manis_database_cmd.main()
+        except SystemExit as err:
+            raise RuntimeError(f"{clips}: rebuild failed - {err}") from err
+        finally:
+            sys.argv = saved
+        if rc not in (0, None):
+            raise RuntimeError(f"{clips}: rebuild returned {rc}")
+        shutil.copyfile(step, out)
     return enabled

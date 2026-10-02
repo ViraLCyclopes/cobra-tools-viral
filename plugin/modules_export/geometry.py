@@ -222,9 +222,10 @@ def export_model(model_info, b_lod_coll, b_ob, b_me, bones_table, apply_transfor
 				except KeyError:
 					# it doesn't, so we have to fill in additional data
 					v_index = count_unique
-					# technically this should work but apparently causes problems down the line
-					# limit = UINT_MAX if mesh.context.version >= 52 else USHORT_MAX
-					limit = USHORT_MAX
+					# Chunked meshes (v52+, JWE2/JWE3) use chunk-local uint8 tri indices and
+					# uint32 vertex offsets; vanilla JWE3 ships meshes of 177,432 verts
+					# (Austroraptor juvenile). Older formats index tris with uint16.
+					limit = UINT_MAX if mesh.context.version >= 52 else USHORT_MAX
 					if v_index > limit:
 						raise OverflowError(
 							f"{b_ob.name} has too many ms2 verts. The limit is {limit}. "

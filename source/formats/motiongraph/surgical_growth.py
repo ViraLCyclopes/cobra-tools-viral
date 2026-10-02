@@ -85,7 +85,8 @@ def plan_tail_pool_allocation(global_pools, archive_pools, pool_type: int,
     if new_size > page_size:
         raise ValueError(
             f"Final type-{pool_type} pool has no room: {old_size} -> {new_size}, "
-            f"page limit {page_size}; creating a new page is not supported"
+            f"observed allocation bound {page_size} (not a proven engine limit); "
+            "creating a new page is not supported"
         )
     try:
         local_pool = next(index for index, pool in enumerate(archive_pools) if pool is target)
