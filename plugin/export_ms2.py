@@ -47,7 +47,7 @@ def get_next_backup_filename(filepath):
 		return os.path.join(sfolder, sname + '~' + str(new_suffix) + sext)
 
 
-def save(reporter, filepath='', backup_original=True, apply_transforms=False, update_rig=False, use_stock_normals_tangents=False, export_scope='FULL', leaf_source=''):
+def save(reporter, filepath='', backup_original=True, apply_transforms=False, update_rig=False, use_stock_normals_tangents=False, export_scope='FULL', leaf_source='', meshlet_chunks=False):
 	if export_scope == 'LEAF':
 		from plugin.leaf_bones import export_leaf
 		armature = bpy.context.object
@@ -182,7 +182,8 @@ def save(reporter, filepath='', backup_original=True, apply_transforms=False, up
 							b_models.append((b_me, shell_index))
 							wrapper = export_model(
 								model_info, lod_coll, b_ob, b_me, bones_table, apply_transforms,
-								use_stock_normals_tangents, m_lod, shell_index, shell_count, mesh_in_lod)
+								use_stock_normals_tangents, m_lod, shell_index, shell_count, mesh_in_lod,
+								meshlet_chunks)
 							wrapper.mesh.lod_index = lod_i
 							wrapper.mesh.stream_info.pool_index = stream_index
 							mesh_in_lod += 1

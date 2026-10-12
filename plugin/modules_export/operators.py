@@ -57,6 +57,12 @@ class ExportMS2(ExportOp):
         name="Use Original Normals & Tangents",
         description="Ignores the actual geometry and uses original normals and tangents stored as mesh attributes on import. Use case: if fur depends on custom normals",
         default=False)
+    meshlet_chunks: BoolProperty(
+        name="Frontier-Style Chunks",
+        description="Split JWE2/JWE3 meshes into chunks with meshoptimizer, as vanilla does: fewer, fuller chunks "
+                    "and far more of them backface-cullable. Fur shells keep the default chunking. "
+                    "Not yet tested in game",
+        default=False)
 
     def invoke(self, context, _event):
         if not self.leaf_source and context.object and context.object.type == 'ARMATURE':
@@ -78,6 +84,7 @@ class ExportMS2(ExportOp):
             layout.label(text='Enable Update Rigs for new or edited bones')
             layout.prop(self, 'apply_transforms')
             layout.prop(self, 'use_stock_normals_tangents')
+            layout.prop(self, 'meshlet_chunks')
 
 
 class ExportSPL(ExportOp):

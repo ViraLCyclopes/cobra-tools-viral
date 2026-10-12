@@ -9,7 +9,7 @@ from plugin.modules_import.armature import import_armature, append_armature_modi
 	get_bone_names
 from plugin.modules_import.collision import import_chunk_bounds
 from plugin.modules_import.geometry import import_mesh_layers, import_shapekeys, ob_postpro, append_mirror_modifier, \
-	get_valid_lod_objects, import_mesh_properties, visualize_chunks
+	get_valid_lod_objects, import_mesh_properties, visualize_chunks, build_chunk_preview
 from plugin.modules_import.material import import_material
 from plugin.utils.fast_mesh import FastMesh
 from plugin.utils.hair import add_psys
@@ -18,7 +18,7 @@ from plugin.utils.object import create_ob, create_scene, create_collection, set_
 from generated.formats.ms2 import Ms2File
 
 
-def load(reporter, filepath: str = "", use_custom_normals: bool = False, mirror_mesh: bool = False, quadrify = True, merge_vertices: bool = True, load_libraries : bool = False, import_fur_psys: bool = False):
+def load(reporter, filepath: str = "", use_custom_normals: bool = False, mirror_mesh: bool = False, quadrify = True, merge_vertices: bool = True, load_libraries : bool = False, import_fur_psys: bool = False, chunk_preview_scene: bool = False):
 	start_time = time.time()
 	in_dir, ms2_name = os.path.split(filepath)
 	ms2_basename = os.path.splitext(ms2_name)[0]
@@ -26,6 +26,8 @@ def load(reporter, filepath: str = "", use_custom_normals: bool = False, mirror_
 	ms2.load(filepath, read_editable=True)
 	scene = create_scene(ms2_basename, len(ms2.modelstream_names), ms2.context.version)
 	bpy.context.window.scene = scene
+	# a separate scene, so the exporter (which walks this scene's LOD collections) never sees it
+	preview_scene = bpy.data.scenes.new(f"{ms2_basename} Chunks") if chunk_preview_scene else None
 	# print(ms2)
 	created_materials = {}
 	for model_info in ms2.model_infos:
@@ -41,6 +43,11 @@ def load(reporter, filepath: str = "", use_custom_normals: bool = False, mirror_
 		for lod_i, m_lod in enumerate(model_info.model.lods):
 			logging.info(f"Importing LOD{lod_i}")
 			lod_coll = create_collection(f"{model_info.name}_L{lod_i}", mdl2_coll)
+			preview_coll = None
+			if preview_scene:
+				preview_coll = bpy.data.collections.new(f"{model_info.name}_L{lod_i} chunks")
+				preview_scene.collection.children.link(preview_coll)
+				preview_coll.hide_viewport = lod_i != 0
 			for ob_i, m_ob in enumerate(get_valid_lod_objects(m_lod)):
 				mesh = m_ob.mesh
 				# print(mesh)
@@ -130,6 +137,12 @@ def load(reporter, filepath: str = "", use_custom_normals: bool = False, mirror_
 					# ob2, me2 = visualize_tangents(b_ob.name, mesh.vertices, mesh.normals, mesh.tangents)
 					except:
 						logging.exception("Some mesh data failed")
+					if preview_coll is not None:
+						try:
+							matrix = b_armature_obj.matrix_basis.copy() if b_armature_obj else b_ob.matrix_basis.copy()
+							build_chunk_preview(mesh, b_ob.name, preview_coll, matrix)
+						except:
+							logging.exception(f"Chunk preview failed for {b_ob.name}")
 				# we can't assume that the first ob referencing this mesh has fur already
 				if import_fur_psys and ms2.context.version > 32 and is_shell(b_ob):
 					# OFF by default: add_psys asks for one hair per vertex with

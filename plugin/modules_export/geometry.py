@@ -9,12 +9,12 @@ from generated.formats.ms2.structs.packing_utils import USHORT_MAX, remap, UINT_
 from generated.formats.ms2.enums.MeshFormat import MeshFormat
 from plugin.utils.object import get_property
 from plugin.modules_export.armature import handle_transforms
-from plugin.modules_export.mesh_chunks import DYNAMIC_ID, ChunkedMesh, NO_BONES_ID, DISCARD_STATIC_TRIS
+from plugin.modules_export.mesh_chunks import DYNAMIC_ID, ChunkedMesh, NO_BONES_ID, DISCARD_STATIC_TRIS, partition_meshlets
 from plugin.utils.blender_util import ensure_tri_modifier, evaluate_mesh
 from plugin.utils.shell import num_fur_as_weights, is_fin, is_shell, FUR_VGROUPS
 
 
-def export_model(model_info, b_lod_coll, b_ob, b_me, bones_table, apply_transforms, use_stock_normals_tangents, m_lod, shell_index, shell_count, mesh_in_lod):
+def export_model(model_info, b_lod_coll, b_ob, b_me, bones_table, apply_transforms, use_stock_normals_tangents, m_lod, shell_index, shell_count, mesh_in_lod, meshlet_chunks=False):
 	logging.info(f"Exporting mesh {b_me.name}")
 	# we create a ms2 mesh
 	wrapper = MeshDataWrap(model_info.context)
@@ -251,7 +251,10 @@ def export_model(model_info, b_lod_coll, b_ob, b_me, bones_table, apply_transfor
 			chunk_tris.append(tuple(tri))
 		logging.debug(f"Preliminary chunk: unique {count_unique}, reused {count_reused} verts")
 		# do final chunk splitting here, as we now have the final split vertices
-		if mesh.context.version >= 52:
+		if mesh.context.version >= 52 and meshlet_chunks and not is_shell(b_ob):
+			# shells keep the greedy 8-vert chunks, which exist to avoid flickering
+			partition_meshlets(chunk_tris, chunk_verts, tris_chunks, verts, b_chunk_bone_id)
+		elif mesh.context.version >= 52:
 			# build table of neighbors
 			cm = ChunkedMesh(chunk_tris, chunk_verts, tris_chunks, verts, b_chunk_bone_id, is_shell(b_ob))
 			cm.partition()
@@ -272,6 +275,8 @@ def export_model(model_info, b_lod_coll, b_ob, b_me, bones_table, apply_transfor
 	# for JWE2 so we can store these on the tri chunks
 	mesh.shell_index = shell_index
 	mesh.shell_count = shell_count
+	# fins and shells are drawn from both sides / expanded in the shader, so never cone-cull them
+	mesh.cull_cones = not (is_fin(b_ob) or is_shell(b_ob))
 	# transfer raw verts into mesh data packed array
 	mesh.tris = tris_chunks
 	if mesh.context.version == 32:

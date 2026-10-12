@@ -7,6 +7,21 @@ from generated.formats.ms2.structs.TriChunk import TriChunk
 from generated.formats.ms2.structs.packing_utils import *
 from generated.formats.ms2.enums.MeshFormat import MeshFormat
 
+_meshopt_bounds = None
+
+
+def cluster_bounds(tri_indices, vertices):
+	"""meshoptimizer cluster bounds, or None if the bundled library can't load (cones stay never-cull)."""
+	global _meshopt_bounds
+	if _meshopt_bounds is None:
+		try:
+			from utils.meshoptimizer.meshlets import compute_cluster_bounds
+			_meshopt_bounds = compute_cluster_bounds
+		except (ImportError, OSError) as err:
+			logging.warning(f"meshoptimizer unavailable, chunk cones left at never-cull: {err}")
+			_meshopt_bounds = False
+	return _meshopt_bounds(tri_indices, vertices) if _meshopt_bounds else None
+
 
 from generated.formats.ms2.imports import name_type_map
 from generated.formats.ms2.structs.MeshData import MeshData
@@ -573,7 +588,14 @@ class ChunkedMesh(MeshData):
 		if self.flag == 13:
 			# set the loc value as center of gravity, or center of bounds?
 			tri_chunk.cone_apex.set(np.mean(vert_chunk.vertices, axis=0))
-		# rot is probably related to the normals of the chunk
+		elif self.context.version >= 54 and getattr(self, "cull_cones", False) \
+				and vert_chunk.weights_flag.mesh_format == MeshFormat.SEPARATE:
+			# vanilla JWE3 cones reproduce meshoptimizer's computeClusterBounds (Austroraptor: 99.3%)
+			bounds = cluster_bounds(tri_chunk.tri_indices, vert_chunk.vertices)
+			if bounds:
+				tri_chunk.cone_apex.set(bounds["cone_apex"])
+				tri_chunk.cone_axis.set(bounds["cone_axis"])
+				tri_chunk.cone_cutoff = bounds["cone_cutoff"]
 
 	def write_data(self):
 		# save tris and verts per chunk, and update the offsets each time

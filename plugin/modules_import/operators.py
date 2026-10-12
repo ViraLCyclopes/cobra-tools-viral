@@ -134,6 +134,12 @@ class ImportMS2(BulkImportOp):
 		name="Add Fur Particle Systems",
 		description="Add a hair particle system to each fur shell, for combing fur. One hair per vertex with interpolated children, so a fur species adds tens of thousands of parent hairs and can peg the GPU or lock up the viewport. Only needed for combing, not for inspecting or re-exporting",
 		default=False)
+	chunk_preview_scene: BoolProperty(
+		name="Chunk Preview Scene",
+		description="Also build a '<file> Chunks' scene with a copy of each mesh colored by chunk and by backface culling "
+					"(Solid view: Color > Attribute; switch the color attribute between chunk_color and cull_color). "
+					"It is a separate scene, so it is never exported",
+		default=False)
 
 
 class ImportSPL(BulkImportOp):

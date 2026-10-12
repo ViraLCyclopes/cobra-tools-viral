@@ -242,6 +242,87 @@ def build_cone_mesh(name, apex, axis, cutoff, length, coll):
 	coll.objects.link(obj)
 	return obj
 
+CULL_COLORS = ((0.16, 0.47, 0.84), (0.55, 0.55, 0.53), (0.86, 0.86, 0.84))  # cone, never culled, no area
+
+
+def chunk_kind(tri_chunk):
+	"""0 = has a backface-culling cone, 1 = never culled (axis 0, cutoff 1), 2 = no-area chunk (all zero)."""
+	axis = tri_chunk.cone_axis
+	if axis.x or axis.y or axis.z:
+		return 0
+	return 2 if float(tri_chunk.cone_cutoff) == 0 else 1
+
+
+def chunk_preview_material():
+	"""One shared material: Mode 0 shows each chunk in its own color, Mode 1 shows cone culling."""
+	mat = bpy.data.materials.get("Chunk Preview")
+	if mat:
+		return mat
+	mat = bpy.data.materials.new("Chunk Preview")
+	mat.use_nodes = True
+	nodes, links = mat.node_tree.nodes, mat.node_tree.links
+	nodes.clear()
+	by_chunk = nodes.new("ShaderNodeVertexColor")
+	by_chunk.layer_name = "chunk_color"
+	by_cull = nodes.new("ShaderNodeVertexColor")
+	by_cull.layer_name = "cull_color"
+	mode = nodes.new("ShaderNodeValue")
+	mode.label = "Mode: 0 chunks, 1 culling"
+	mode.outputs[0].default_value = 0.0
+	mix = nodes.new("ShaderNodeMix")
+	mix.data_type = 'RGBA'
+	sockets = {s.identifier: s for s in mix.inputs}
+	links.new(mode.outputs[0], sockets["Factor_Float"])
+	links.new(by_chunk.outputs["Color"], sockets["A_Color"])
+	links.new(by_cull.outputs["Color"], sockets["B_Color"])
+	emit = nodes.new("ShaderNodeEmission")
+	out = nodes.new("ShaderNodeOutputMaterial")
+	links.new(next(s for s in mix.outputs if s.identifier == "Result_Color"), emit.inputs["Color"])
+	links.new(emit.outputs[0], out.inputs["Surface"])
+	for x, node in enumerate((mode, by_chunk, mix, emit, out)):
+		node.location = (x * 220, 0)
+	by_cull.location = (220, -180)
+	return mat
+
+
+def build_chunk_preview(mesh, name, coll, matrix):
+	"""A copy of one imported mesh colored by chunk and by cone culling, for a preview scene only.
+
+	Built straight from the decoded chunks, without merging or quadrifying, so every face maps to
+	exactly one chunk. Lives outside the LOD collections, so the exporter never sees it."""
+	tri_chunks = getattr(mesh, "tri_chunks", None)
+	if tri_chunks is None or not len(tri_chunks):
+		return None
+	faces, chunk_ids, kinds = [], [], []
+	for i, tri_chunk in enumerate(tri_chunks):
+		tris = np.flip(np.asarray(tri_chunk.tri_indices, dtype=np.int64).reshape(-1, 3), axis=-1)
+		tris = tris[(tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2]) & (tris[:, 0] != tris[:, 2])]
+		faces.append(tris)
+		chunk_ids.append(np.full(len(tris), i))
+		kinds.append(np.full(len(tris), chunk_kind(tri_chunk)))
+	faces, chunk_ids, kinds = np.concatenate(faces), np.concatenate(chunk_ids), np.concatenate(kinds)
+	b_me = bpy.data.meshes.new(f"{name} chunks")
+	b_me.from_pydata(np.asarray(mesh.vertices, dtype=np.float32).tolist(), [], faces.tolist())
+	b_me.update()
+	b_me.attributes.new("chunk_index", 'INT', 'FACE').data.foreach_set("value", chunk_ids.astype(np.int32))
+	b_me.attributes.new("chunk_cull", 'INT', 'FACE').data.foreach_set("value", kinds.astype(np.int32))
+	# golden-ratio hues keep neighbouring chunk indices visibly different
+	hue = (np.arange(len(tri_chunks)) * 0.6180339887) % 1.0
+	chunk_rgb = np.stack([colorsys.hsv_to_rgb(h, 0.55, 0.9) for h in hue])
+	for attr, rgb in (("chunk_color", chunk_rgb[chunk_ids]), ("cull_color", np.asarray(CULL_COLORS)[kinds])):
+		rgba = np.concatenate([rgb, np.ones((len(rgb), 1))], axis=1)
+		layer = b_me.color_attributes.new(attr, 'BYTE_COLOR', 'CORNER')
+		layer.data.foreach_set("color_srgb", np.repeat(rgba, 3, axis=0).astype(np.float32).ravel())
+	b_me.color_attributes.active_color_name = "chunk_color"
+	b_me.materials.append(chunk_preview_material())
+	b_ob = bpy.data.objects.new(f"{name} chunks", b_me)
+	b_ob.matrix_basis = matrix
+	coll.objects.link(b_ob)
+	b_ob["chunk_count"] = len(tri_chunks)
+	b_ob["cullable_chunks"] = sum(chunk_kind(tc) == 0 for tc in tri_chunks)
+	return b_ob
+
+
 def visualize_chunks(mesh, b_ob_name, coll):
 	"""Generates meshes for chunks, applies random materials, and builds bounds cones grouped by AABB."""
 
